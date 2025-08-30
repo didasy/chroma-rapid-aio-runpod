@@ -28,71 +28,87 @@ RUN python -m pip install --upgrade pip && pip install \
     "runpod>=1.6.0"
 
 # Create deterministic, baked-in locations
-RUN mkdir -p /opt/chroma /opt/aio /app /weights/hf /weights/huggingface
+RUN mkdir -p /opt/chroma /opt/flux /opt/aio /app /weights/hf /weights/huggingface
 WORKDIR /app
 
-# ---------- Bake Chroma base snapshot (requires HF token at build time) ----------
-# Pass the token with:  docker build --build-arg HF_TOKEN=hf_xxx -t yourimage .
-ARG HF_TOKEN
-# Snapshot only the needed files into /opt/chroma; no symlinks; no runtime network needed
-RUN HF_TOKEN=$HF_TOKEN python - <<'PY'
-import os, sys, shutil
+# --- Snapshot Chroma base (public) ---
+RUN python - <<'PY'
 from huggingface_hub import snapshot_download
-
-repo_id = "lodestones/Chroma"
-local_dir = "/opt/chroma"
-allow = [
-    "model_index.json",
-    "*.json",
-    "ae.safetensors",      # VAE (naming may evolve)
-    "vae/*",
-    "text_encoder/*",
-    "tokenizer/*",
-    "*.safetensors",
-]
 snapshot_download(
-    repo_id=repo_id,
-    token=os.getenv("HF_TOKEN"),
-    local_dir=local_dir,
+    repo_id="lodestones/Chroma",
+    local_dir="/opt/chroma",
     local_dir_use_symlinks=False,
-    allow_patterns=allow,
+    allow_patterns=[
+        "model_index.json",
+        "*.json",
+        "ae.safetensors",   # VAE file name, if present
+        "vae/*",            # VAE folder, if present
+        "text_encoder/*",   # Flux T5 encoder (sometimes stored here)
+        "tokenizer/*",
+        "*.safetensors",
+    ],
 )
-print("Chroma base snapshot ready at", local_dir)
+print("Chroma snapshot -> /opt/chroma")
 PY
 
-# ---------- Bake AIO transformer weights ----------
-# Pull Phr00t/Chroma-Rapid-AIO and place one .safetensors file at /opt/aio/chroma_aio.safetensors
+# --- Snapshot FLUX.1-schnell (public, Apache-2.0) as a safety net for VAE/T5 ---
 RUN python - <<'PY'
-import os, shutil, glob
 from huggingface_hub import snapshot_download
-
-repo_id = "Phr00t/Chroma-Rapid-AIO"
-tmp_dir = "/opt/aio_src"
-dst_dir = "/opt/aio"
-dst_file = os.path.join(dst_dir, "chroma_aio.safetensors")
-
-os.makedirs(dst_dir, exist_ok=True)
 snapshot_download(
-    repo_id=repo_id,
-    local_dir=tmp_dir,
+    repo_id="black-forest-labs/FLUX.1-schnell",
+    local_dir="/opt/flux",
+    local_dir_use_symlinks=False,
+    allow_patterns=[
+        "model_index.json","*.json","*.safetensors",
+        "text_encoder/*","tokenizer/*","vae/*","ae.safetensors"
+    ],
+)
+print("Flux schnell snapshot -> /opt/flux")
+PY
+
+# --- Merge any missing components into /opt/chroma so it’s self-contained offline ---
+RUN python - <<'PY'
+import os, shutil
+pairs = [
+    ("/opt/flux/text_encoder", "/opt/chroma/text_encoder"),
+    ("/opt/flux/tokenizer",    "/opt/chroma/tokenizer"),
+    ("/opt/flux/vae",          "/opt/chroma/vae"),
+]
+for src, dst in pairs:
+    if os.path.isdir(src) and not os.path.exists(dst):
+        shutil.copytree(src, dst)
+ae_src = "/opt/flux/ae.safetensors"
+ae_dst = "/opt/chroma/ae.safetensors"
+if os.path.exists(ae_src) and not os.path.exists(ae_dst):
+    shutil.copy2(ae_src, ae_dst)
+print("Ensured /opt/chroma has VAE + text encoder/tokenizer if needed")
+PY
+
+# --- Snapshot AIO transformer weights (public) ---
+RUN python - <<'PY'
+import os, glob, shutil
+from huggingface_hub import snapshot_download
+tmp="/opt/aio_src"; dst="/opt/aio"; os.makedirs(dst, exist_ok=True)
+snapshot_download(
+    repo_id="Phr00t/Chroma-Rapid-AIO",
+    local_dir=tmp,
     local_dir_use_symlinks=False,
     allow_patterns=["Chroma-Rapid-AIO-v2.safetensors","Chroma-Rapid-AIO.safetensors"],
 )
-candidates = glob.glob(os.path.join(tmp_dir, "*.safetensors"))
-if not candidates:
-    raise SystemExit("No AIO .safetensors found in snapshot.")
-# pick the largest (v2 usually)
-best = max(candidates, key=lambda p: os.path.getsize(p))
-shutil.copy2(best, dst_file)
-shutil.rmtree(tmp_dir, ignore_errors=True)
-print("AIO checkpoint ready at", dst_file)
+cands=glob.glob(os.path.join(tmp, "*.safetensors"))
+if not cands:
+    raise SystemExit("No AIO .safetensors downloaded")
+best=max(cands, key=lambda p: os.path.getsize(p))
+shutil.copy2(best, os.path.join(dst, "chroma_aio.safetensors"))
+shutil.rmtree(tmp, ignore_errors=True)
+print("AIO checkpoint -> /opt/aio/chroma_aio.safetensors")
 PY
 
-# Optional: remove HF caches so only baked paths remain
+# Optional: trim hub caches so only baked paths remain
 RUN rm -rf /root/.cache/huggingface
 
 # App code
 COPY handler.py /app/handler.py
 
-# Runtime is fully offline; handler reads /opt/chroma and /opt/aio/chroma_aio.safetensors
+# Runtime is fully offline; handler loads from /opt/chroma and /opt/aio/chroma_aio.safetensors
 CMD ["python", "-u", "handler.py"]
