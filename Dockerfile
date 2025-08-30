@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git libgl1 && \
     rm -rf /var/lib/apt/lists/*
 
-# Core libs + HF hub + S3 client + runpod
+# Core libs + HF hub + S3 client + runpod + hf_transfer (✨ NEW)
 RUN python -m pip install --upgrade pip && pip install \
     "diffusers==0.35.1" \
     "transformers>=4.44.2,<4.46" \
@@ -25,7 +25,8 @@ RUN python -m pip install --upgrade pip && pip install \
     "sentencepiece>=0.2.0" \
     "pillow>=10.4.0" \
     "boto3>=1.34.0" \
-    "runpod>=1.6.0"
+    "runpod>=1.6.0" \
+    "hf_transfer>=0.1.5"
 
 # Create deterministic, baked-in locations
 RUN mkdir -p /opt/chroma /opt/flux /opt/aio /app /weights/hf /weights/huggingface
@@ -43,7 +44,7 @@ snapshot_download(
         "*.json",
         "ae.safetensors",   # VAE file name, if present
         "vae/*",            # VAE folder, if present
-        "text_encoder/*",   # Flux T5 encoder (sometimes stored here)
+        "text_encoder/*",
         "tokenizer/*",
         "*.safetensors",
     ],
@@ -51,7 +52,7 @@ snapshot_download(
 print("Chroma snapshot -> /opt/chroma")
 PY
 
-# --- Snapshot FLUX.1-schnell (public, Apache-2.0) as a safety net for VAE/T5 ---
+# --- Snapshot FLUX.1-schnell (public) ---
 RUN python - <<'PY'
 from huggingface_hub import snapshot_download
 snapshot_download(
@@ -66,7 +67,7 @@ snapshot_download(
 print("Flux schnell snapshot -> /opt/flux")
 PY
 
-# --- Merge any missing components into /opt/chroma so it’s self-contained offline ---
+# --- Merge any missing pieces into /opt/chroma ---
 RUN python - <<'PY'
 import os, shutil
 pairs = [
@@ -110,5 +111,5 @@ RUN rm -rf /root/.cache/huggingface
 # App code
 COPY handler.py /app/handler.py
 
-# Runtime is fully offline; handler loads from /opt/chroma and /opt/aio/chroma_aio.safetensors
+# Fully offline at runtime; handler loads from /opt/chroma and /opt/aio/chroma_aio.safetensors
 CMD ["python", "-u", "handler.py"]
