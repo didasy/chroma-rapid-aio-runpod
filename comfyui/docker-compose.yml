@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  comfyui:
+    image: python:3.10-slim
+    container_name: comfyui
+    ports:
+      - "${COMFYUI_PORT:-8188}:8188"
+    env_file:
+      - .env
+    volumes:
+      - ./comfyui/models:/opt/ComfyUI/models
+      - ./comfyui/output:/opt/ComfyUI/output
+      - ./comfyui/custom_nodes:/opt/ComfyUI/custom_nodes
+      - ./comfyui/user:/opt/ComfyUI/user
+    working_dir: /opt
+    command: >
+      bash -lc "
+      set -e;
+      apt-get update && apt-get install -y --no-install-recommends git curl && rm -rf /var/lib/apt/lists/*;
+      if [ ! -d ComfyUI ]; then git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git; fi;
+      cd ComfyUI;
+      python -m pip install --upgrade pip;
+      pip install --no-cache-dir -r requirements.txt;
+      mkdir -p custom_nodes;
+      if [ ! -d custom_nodes/ComfyUI-Manager ]; then git clone --depth=1 https://github.com/Comfy-Org/ComfyUI-Manager custom_nodes/ComfyUI-Manager; fi;
+      if [ ! -d custom_nodes/ComfyUI-RequestNodes ]; then git clone --depth=1 https://github.com/felixszeto/ComfyUI-RequestNodes custom_nodes/ComfyUI-RequestNodes; fi;
+      python main.py --listen 0.0.0.0 --port 8188 --output-directory /opt/ComfyUI/output
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8188 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
