@@ -1,4 +1,4 @@
-# CUDA 12.6 + cuDNN 9 + PyTorch 2.6 (Runpod-friendly)
+# CUDA 12.6 + cuDNN 9 + PyTorch 2.6
 FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -15,12 +15,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git libgl1 && \
     rm -rf /var/lib/apt/lists/*
 
-# Core libs + HF hub + S3 client + runpod + hf_transfer (✨ NEW)
+# Core libs + hf_transfer (fixes previous build error) + S3 client + runpod
 RUN python -m pip install --upgrade pip && pip install \
     "diffusers==0.35.1" \
     "transformers>=4.44.2,<4.46" \
     "accelerate>=1.0.0" \
-    "huggingface_hub>=0.24.6" \
+    "huggingface_hub>=0.34.4" \
     "safetensors>=0.4.5" \
     "sentencepiece>=0.2.0" \
     "pillow>=10.4.0" \
@@ -28,11 +28,11 @@ RUN python -m pip install --upgrade pip && pip install \
     "runpod>=1.6.0" \
     "hf_transfer>=0.1.5"
 
-# Create deterministic, baked-in locations
-RUN mkdir -p /opt/chroma /opt/flux /opt/aio /app /weights/hf /weights/huggingface
+# Deterministic, baked-in locations
+RUN mkdir -p /opt/chroma /opt/aio /app /weights/hf /weights/huggingface
 WORKDIR /app
 
-# --- Snapshot Chroma base (public) ---
+# --- Snapshot Chroma base (PUBLIC) ---
 RUN python - <<'PY'
 from huggingface_hub import snapshot_download
 snapshot_download(
@@ -42,8 +42,8 @@ snapshot_download(
     allow_patterns=[
         "model_index.json",
         "*.json",
-        "ae.safetensors",   # VAE file name, if present
-        "vae/*",            # VAE folder, if present
+        "ae.safetensors",
+        "vae/*",
         "text_encoder/*",
         "tokenizer/*",
         "*.safetensors",
@@ -52,40 +52,7 @@ snapshot_download(
 print("Chroma snapshot -> /opt/chroma")
 PY
 
-# --- Snapshot FLUX.1-schnell (public) ---
-RUN python - <<'PY'
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id="black-forest-labs/FLUX.1-schnell",
-    local_dir="/opt/flux",
-    local_dir_use_symlinks=False,
-    allow_patterns=[
-        "model_index.json","*.json","*.safetensors",
-        "text_encoder/*","tokenizer/*","vae/*","ae.safetensors"
-    ],
-)
-print("Flux schnell snapshot -> /opt/flux")
-PY
-
-# --- Merge any missing pieces into /opt/chroma ---
-RUN python - <<'PY'
-import os, shutil
-pairs = [
-    ("/opt/flux/text_encoder", "/opt/chroma/text_encoder"),
-    ("/opt/flux/tokenizer",    "/opt/chroma/tokenizer"),
-    ("/opt/flux/vae",          "/opt/chroma/vae"),
-]
-for src, dst in pairs:
-    if os.path.isdir(src) and not os.path.exists(dst):
-        shutil.copytree(src, dst)
-ae_src = "/opt/flux/ae.safetensors"
-ae_dst = "/opt/chroma/ae.safetensors"
-if os.path.exists(ae_src) and not os.path.exists(ae_dst):
-    shutil.copy2(ae_src, ae_dst)
-print("Ensured /opt/chroma has VAE + text encoder/tokenizer if needed")
-PY
-
-# --- Snapshot AIO transformer weights (public) ---
+# --- Snapshot AIO transformer weights (PUBLIC) ---
 RUN python - <<'PY'
 import os, glob, shutil
 from huggingface_hub import snapshot_download
@@ -105,11 +72,11 @@ shutil.rmtree(tmp, ignore_errors=True)
 print("AIO checkpoint -> /opt/aio/chroma_aio.safetensors")
 PY
 
-# Optional: trim hub caches so only baked paths remain
+# Optional: trim hub caches
 RUN rm -rf /root/.cache/huggingface
 
-# App code
+# App
 COPY handler.py /app/handler.py
 
-# Fully offline at runtime; handler loads from /opt/chroma and /opt/aio/chroma_aio.safetensors
+# Runtime is fully offline; handler loads from /opt/chroma and /opt/aio/chroma_aio.safetensors
 CMD ["python", "-u", "handler.py"]
