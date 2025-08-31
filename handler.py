@@ -1,5 +1,5 @@
 import os, io, time, uuid, stat, tarfile, shutil, logging, threading, urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import runpod
 import torch
@@ -12,7 +12,6 @@ except Exception:
 
 import boto3
 from botocore.config import Config as BotoConfig
-
 from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -28,16 +27,16 @@ os.makedirs(CACHE_ROOT, exist_ok=True)
 CHROMA_BASE_ID   = os.getenv("CHROMA_BASE_ID", "lodestones/Chroma")
 CHROMA_LOCAL_DIR = os.getenv("CHROMA_LOCAL_DIR", os.path.join(CACHE_ROOT, "chroma"))
 
-AIO_REPO         = os.getenv("AIO_REPO", "Phr00t/Chroma-Rapid-AIO")
-AIO_FILENAMES    = [
+AIO_REPO       = os.getenv("AIO_REPO", "Phr00t/Chroma-Rapid-AIO")
+AIO_FILENAMES  = [
     os.getenv("AIO_FILENAME_PRI", "Chroma-Rapid-AIO-v2.safetensors"),
     os.getenv("AIO_FILENAME_ALT", "Chroma-Rapid-AIO.safetensors"),
     "chroma-rapid-aio.safetensors",
 ]
-AIO_LOCAL_PATH   = os.getenv("AIO_LOCAL_PATH", os.path.join(CACHE_ROOT, "chroma_aio.safetensors"))
-AIO_URL          = os.getenv("AIO_URL")
-SNAPSHOT_URL     = os.getenv("SNAPSHOT_URL")
-HF_TOKEN         = os.getenv("HF_TOKEN")
+AIO_LOCAL_PATH = os.getenv("AIO_LOCAL_PATH", os.path.join(CACHE_ROOT, "chroma_aio.safetensors"))
+AIO_URL        = os.getenv("AIO_URL")
+SNAPSHOT_URL   = os.getenv("SNAPSHOT_URL")
+HF_TOKEN       = os.getenv("HF_TOKEN")
 
 # Hugging Face caches (force to /cache and limit size)
 HF_HOME_DEFAULT = os.path.join(CACHE_ROOT, "hf_cache")
@@ -59,8 +58,11 @@ S3_VERIFY_SSL          = os.getenv("S3_VERIFY_SSL", "1")
 S3_CONTENT_DISPOSITION = os.getenv("S3_CONTENT_DISPOSITION", "inline")
 
 MIN_FREE_GB      = float(os.getenv("MIN_FREE_GB", "50"))
-DTYPE            = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-DEVICE           = "cuda" if torch.cuda.is_available() else "cpu"
+LOW_VRAM         = str(os.getenv("LOW_VRAM", "1")).strip().lower() not in ("0","false","no","off")
+FORCE_FP16       = str(os.getenv("FORCE_FP16", "1")).strip().lower() not in ("0","false","no","off")
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE  = torch.float16 if (torch.cuda.is_available() and FORCE_FP16) else (torch.bfloat16 if torch.cuda.is_available() else torch.float32)
 
 ENABLE_HTTP      = os.getenv("ENABLE_HTTP", "1")
 PORT             = int(os.getenv("PORT", "3000"))
@@ -131,6 +133,8 @@ def _path_report() -> Dict[str, Any]:
         "aio_local_path": AIO_LOCAL_PATH,
         "free_gb_cache_root": round(_free_gb(CACHE_ROOT), 2),
         "free_gb_rootfs": round(_free_gb("/"), 2),
+        "dtype": str(DTYPE),
+        "low_vram": LOW_VRAM,
     }
 
 # ------------------ S3 ------------------
@@ -263,6 +267,20 @@ def _import_diffusers():
         T2D = None
     return DiffusionPipeline, FlowMatchEulerDiscreteScheduler, CPipe, CTrans, T2D
 
+def _apply_memory_saving(pipe):
+    try:
+        pipe.enable_attention_slicing("max")
+    except Exception:
+        try: pipe.enable_attention_slicing()
+        except Exception: pass
+    try: pipe.enable_vae_slicing()
+    except Exception: pass
+    try: pipe.enable_vae_tiling()
+    except Exception: pass
+    if LOW_VRAM:
+        try: pipe.enable_sequential_cpu_offload()
+        except Exception: pass
+
 def _build_pipeline(metrics: Dict[str, Any]):
     global _PIPE
     if _PIPE is not None:
@@ -304,35 +322,73 @@ def _build_pipeline(metrics: Dict[str, Any]):
     if FMEDS is not None and hasattr(pipe, "scheduler"):
         pipe.scheduler = FMEDS.from_config(pipe.scheduler.config)
 
+    _apply_memory_saving(pipe)
     pipe.to(DEVICE, dtype=DTYPE)
     _PIPE = pipe
-    log.info("Chroma pipeline ready.")
+    log.info("Chroma pipeline ready (dtype=%s, low_vram=%s).", DTYPE, LOW_VRAM)
     return _PIPE
 
-def generate_images(
-    prompt: str,
-    negative_prompt: Optional[str] = None,
-    steps: int = 6,
-    num_images: int = 1,
-    width: Optional[int] = None,
-    height: Optional[int] = None,
-    guidance_scale: Optional[float] = None,
-) -> List[Image.Image]:
+# ------------------ Inference ------------------
+def _round8(x: int) -> int:
+    return max(64, int(x // 8) * 8)
+
+def _parse_size(s: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
+    if not s or not isinstance(s, str): return None, None
+    try:
+        w, h = s.lower().split("x")
+        return _round8(int(w)), _round8(int(h))
+    except Exception:
+        return None, None
+
+def generate_images(prompt: str, negative_prompt: Optional[str] = None,
+                    steps: int = 6, num_images: int = 1,
+                    width: Optional[int] = None, height: Optional[int] = None,
+                    guidance_scale: Optional[float] = None,
+                    seed: Optional[int] = None) -> List[Image.Image]:
     with _PIPE_LOCK:
         _build_pipeline({})
         pipe = _PIPE
 
-    gen = {"prompt": prompt, "num_inference_steps": int(steps)}
-    if negative_prompt: gen["negative_prompt"] = negative_prompt
-    if guidance_scale is not None: gen["guidance_scale"] = float(guidance_scale)
-    if width: gen["width"] = int(width)
-    if height: gen["height"] = int(height)
+    W = _round8(width if width else 768)
+    H = _round8(height if height else 768)
+    N = max(1, int(num_images))
+    steps = int(steps)
 
-    out = pipe(**gen)
-    images = out.images if hasattr(out, "images") else out
-    if not isinstance(images, list): images = [images]
-    if num_images and len(images) > num_images: images = images[:num_images]
-    return images
+    base_kwargs = {
+        "prompt": prompt,
+        "num_inference_steps": steps,
+        "width": W,
+        "height": H,
+    }
+    if negative_prompt: base_kwargs["negative_prompt"] = negative_prompt
+    if guidance_scale is not None: base_kwargs["guidance_scale"] = float(guidance_scale)
+
+    def _single(gen_seed: Optional[int]):
+        gen = torch.Generator(device=DEVICE) if torch.cuda.is_available() else torch.Generator()
+        if gen_seed is not None:
+            gen = gen.manual_seed(int(gen_seed))
+        out = pipe(**base_kwargs, generator=gen)
+        imgs = out.images if hasattr(out, "images") else out
+        return imgs if isinstance(imgs, list) else [imgs]
+
+    images: List[Image.Image] = []
+    try:
+        images = _single(seed)
+    except RuntimeError as e:
+        if "out of memory" not in str(e).lower():
+            raise
+        torch.cuda.empty_cache()
+        base_kwargs["num_inference_steps"] = min(base_kwargs["num_inference_steps"], 6)
+        base_kwargs["width"]  = _round8(int(base_kwargs["width"]  * 0.75)) if base_kwargs["width"]  > 768 else 640
+        base_kwargs["height"] = _round8(int(base_kwargs["height"] * 0.75)) if base_kwargs["height"] > 768 else 640
+        images = _single(seed)
+
+    while len(images) < N:
+        torch.cuda.empty_cache()
+        more = _single(None if seed is None else seed + len(images))
+        images += more
+
+    return images[:N]
 
 # ------------------ ComfyUI graph parsing (heuristic) ------------------
 def parse_comfy_prompt_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -381,7 +437,8 @@ def parse_comfy_prompt_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "height": height,
         "guidance_scale": guidance,
         "num_images": int(payload.get("num_images", 1)),
-        "output_format": str(payload.get("output_format", "PNG")).upper()
+        "output_format": str(payload.get("output_format", "PNG")).upper(),
+        "seed": payload.get("seed"),
     }
 
 # ------------------ Core processing (shared by both modes) ------------------
@@ -409,6 +466,17 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
             _build_pipeline({})
         return {"status": "ok", "warmed": True}
 
+    # --- Flexible request keys ---
+    prompt = input_data.get("prompt")
+    if input_data.get("size") and (not input_data.get("width") or not input_data.get("height")):
+        w, h = _parse_size(input_data.get("size"))
+        if w: input_data["width"] = w
+        if h: input_data["height"] = h
+    if "n" in input_data and "num_images" not in input_data:
+        input_data["num_images"] = input_data.get("n")
+    if "cfg" in input_data and "guidance_scale" not in input_data:
+        input_data["guidance_scale"] = input_data.get("cfg")
+
     if input_data.get("comfy"):
         params = parse_comfy_prompt_payload(input_data.get("payload") or {})
         if not params["prompt"]:
@@ -421,6 +489,7 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
             width=params["width"],
             height=params["height"],
             guidance_scale=params["guidance_scale"],
+            seed=params.get("seed"),
         )
         if not _have_s3():
             return {"status": "error", "error": "missing S3 envs"}
@@ -430,7 +499,6 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
         HISTORY[pid] = {"status": "completed", "outputs": {"result": {"images": [{"url": u} for u in urls]}}}
         return {"status": "ok", "prompt_id": pid}
 
-    prompt = input_data.get("prompt")
     if not prompt or not isinstance(prompt, str):
         with _PIPE_LOCK:
             _build_pipeline({})
@@ -444,6 +512,7 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
         width=input_data.get("width"),
         height=input_data.get("height"),
         guidance_scale=input_data.get("guidance_scale"),
+        seed=input_data.get("seed"),
     )
     if not _have_s3():
         return {"status": "error", "error": "missing S3 envs"}
@@ -452,7 +521,7 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "ok", "count": len(urls), "results": [{"url": u} for u in urls]}
 
 # ------------------ FastAPI app (Load Balancer + ComfyUI) ------------------
-app = FastAPI(title="Chroma Hybrid API", version="1.2.0")
+app = FastAPI(title="Chroma Hybrid API", version="1.3.0")
 
 @app.get("/health")
 def health():
@@ -482,6 +551,7 @@ def comfy_prompt(payload: Dict[str, Any] = Body(...)):
         width=params["width"],
         height=params["height"],
         guidance_scale=params["guidance_scale"],
+        seed=params.get("seed"),
     )
     if not _have_s3():
         raise HTTPException(status_code=500, detail="Missing S3 envs for output upload.")
