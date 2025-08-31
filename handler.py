@@ -5,54 +5,67 @@ import runpod
 import torch
 from PIL import Image
 from huggingface_hub import snapshot_download, hf_hub_download
+
 import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s|%(levelname)s|%(message)s")
-log = logging.getLogger("chroma-aio")
+from fastapi import FastAPI, HTTPException, Body, Request
+from fastapi.responses import JSONResponse
+import uvicorn
 
-CHROMA_BASE_ID = os.getenv("CHROMA_BASE_ID", "lodestones/Chroma")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s|%(levelname)s|%(message)s")
+log = logging.getLogger("chroma-hybrid")
+
+# --------- Env / Config (Option B: ephemeral only) ---------
+CHROMA_BASE_ID   = os.getenv("CHROMA_BASE_ID", "lodestones/Chroma")
 CHROMA_LOCAL_DIR = os.getenv("CHROMA_LOCAL_DIR", "/tmp/chroma")
-AIO_REPO = os.getenv("AIO_REPO", "Phr00t/Chroma-Rapid-AIO")
-AIO_FILENAMES = [
+AIO_REPO         = os.getenv("AIO_REPO", "Phr00t/Chroma-Rapid-AIO")
+AIO_FILENAMES    = [
     os.getenv("AIO_FILENAME_PRI", "Chroma-Rapid-AIO-v2.safetensors"),
     os.getenv("AIO_FILENAME_ALT", "Chroma-Rapid-AIO.safetensors"),
     "chroma-rapid-aio.safetensors",
 ]
-AIO_LOCAL_PATH = os.getenv("AIO_LOCAL_PATH", "/tmp/chroma_aio.safetensors")
-AIO_URL = os.getenv("AIO_URL")
-SNAPSHOT_URL = os.getenv("SNAPSHOT_URL")
-HF_TOKEN = os.getenv("HF_TOKEN")
+AIO_LOCAL_PATH   = os.getenv("AIO_LOCAL_PATH", "/tmp/chroma_aio.safetensors")
+AIO_URL          = os.getenv("AIO_URL")
+SNAPSHOT_URL     = os.getenv("SNAPSHOT_URL")
+HF_TOKEN         = os.getenv("HF_TOKEN")
 
-HF_HOME = os.getenv("HF_HOME", "/tmp/hf_cache")
+HF_HOME               = os.getenv("HF_HOME", "/tmp/hf_cache")
+HUGGINGFACE_HUB_CACHE = os.getenv("HUGGINGFACE_HUB_CACHE", HF_HOME)
+TRANSFORMERS_CACHE    = os.getenv("TRANSFORMERS_CACHE", HF_HOME)
 
-S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")
-S3_REGION = os.getenv("S3_REGION", "us-west-000")
-S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
-S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
-S3_BUCKET = os.getenv("S3_BUCKET")
-S3_PREFIX = os.getenv("S3_PREFIX", "chroma/outputs")
-S3_PRESIGN_EXPIRES = int(os.getenv("S3_PRESIGN_EXPIRES", "3600"))
-S3_USE_SSL = os.getenv("S3_USE_SSL", "1")
-S3_VERIFY_SSL = os.getenv("S3_VERIFY_SSL", "1")
+S3_ENDPOINT_URL        = os.getenv("S3_ENDPOINT_URL")
+S3_REGION              = os.getenv("S3_REGION", "us-west-000")
+S3_ACCESS_KEY          = os.getenv("S3_ACCESS_KEY")
+S3_SECRET_KEY          = os.getenv("S3_SECRET_KEY")
+S3_BUCKET              = os.getenv("S3_BUCKET")
+S3_PREFIX              = os.getenv("S3_PREFIX", "chroma/outputs")
+S3_PRESIGN_EXPIRES     = int(os.getenv("S3_PRESIGN_EXPIRES", "3600"))
+S3_USE_SSL             = os.getenv("S3_USE_SSL", "1")
+S3_VERIFY_SSL          = os.getenv("S3_VERIFY_SSL", "1")
 S3_CONTENT_DISPOSITION = os.getenv("S3_CONTENT_DISPOSITION", "inline")
 
-MIN_FREE_GB = float(os.getenv("MIN_FREE_GB", "50"))
+MIN_FREE_GB      = float(os.getenv("MIN_FREE_GB", "50"))
+DTYPE            = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+DEVICE           = "cuda" if torch.cuda.is_available() else "cpu"
 
-DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+ENABLE_HTTP      = os.getenv("ENABLE_HTTP", "1")
+PORT             = int(os.getenv("PORT", "3000"))
 
+# --------- Globals ---------
 _PIPE = None
 _PIPE_LOCK = threading.Lock()
+HISTORY: Dict[str, Dict[str, Any]] = {}
 
+# --------- Utils ---------
 def _free_gb(path: str) -> float:
     total, used, free = shutil.disk_usage(path)
     return free / (1024**3)
 
 def _ensure_free_space(path: str, need_gb: float):
     if _free_gb(path) < need_gb:
-        raise RuntimeError("not enough free space")
+        raise RuntimeError("not enough free space on ephemeral disk")
 
 def _safe_symlink(target: str, link: str):
     if os.path.islink(link) or os.path.exists(link):
@@ -93,10 +106,8 @@ def _have_s3() -> bool:
 
 def _parse_verify(v: str):
     v = str(v).strip().lower()
-    if v in ("0", "false", "no", "off"):
-        return False
-    if v in ("1", "true", "yes", "on"):
-        return True
+    if v in ("0","false","no","off"): return False
+    if v in ("1","true","yes","on"):  return True
     return v
 
 def _s3_client():
@@ -107,7 +118,7 @@ def _s3_client():
         region_name=S3_REGION,
         aws_access_key_id=S3_ACCESS_KEY,
         aws_secret_access_key=S3_SECRET_KEY,
-        use_ssl=(str(S3_USE_SSL).strip().lower() not in ("0", "false", "no", "off")),
+        use_ssl=(str(S3_USE_SSL).strip().lower() not in ("0","false","no","off")),
         verify=_parse_verify(S3_VERIFY_SSL),
         config=BotoConfig(s3={"addressing_style": "virtual"}, signature_version="s3v4"),
     )
@@ -125,6 +136,7 @@ def _upload_and_presign(img: Image.Image, fmt: str = "PNG") -> str:
     c.put_object(Bucket=S3_BUCKET, Key=key, Body=buf.getvalue(), **extra)
     return c.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=S3_PRESIGN_EXPIRES)
 
+# --------- Asset Ensure (ephemeral) ---------
 def _ensure_aio(metrics: Dict[str, Any]) -> str:
     if os.path.exists(AIO_LOCAL_PATH) and os.path.getsize(AIO_LOCAL_PATH) > 0:
         metrics["aio"] = {"source": "local", "size_bytes": os.path.getsize(AIO_LOCAL_PATH), "seconds": 0}
@@ -165,10 +177,17 @@ def _ensure_snapshot(metrics: Dict[str, Any]) -> str:
         metrics["snapshot"] = {"source": "url", "size_bytes": size, "seconds": time.time() - t0}
         return CHROMA_LOCAL_DIR
     t0 = time.time()
-    snapshot_download(repo_id=CHROMA_BASE_ID, local_dir=CHROMA_LOCAL_DIR, local_dir_use_symlinks=True, allow_patterns=["model_index.json","*.json","ae.safetensors","vae/*","text_encoder/*","tokenizer/*","*.safetensors"], token=HF_TOKEN or None)
+    snapshot_download(
+        repo_id=CHROMA_BASE_ID,
+        local_dir=CHROMA_LOCAL_DIR,
+        local_dir_use_symlinks=True,
+        allow_patterns=["model_index.json","*.json","ae.safetensors","vae/*","text_encoder/*","tokenizer/*","*.safetensors"],
+        token=HF_TOKEN or None
+    )
     metrics["snapshot"] = {"source": "huggingface", "size_bytes": _dir_size_bytes(CHROMA_LOCAL_DIR), "seconds": time.time() - t0}
     return CHROMA_LOCAL_DIR
 
+# --------- Diffusers ---------
 def _import_diffusers():
     from diffusers import DiffusionPipeline
     try:
@@ -193,12 +212,12 @@ def _build_pipeline(metrics: Dict[str, Any]):
     global _PIPE
     if _PIPE is not None:
         return _PIPE
-    ck_m = {}
-    sp_m = {}
+    ck_m, sp_m = {}, {}
     ckpt = _ensure_aio(ck_m)
     _ensure_snapshot(sp_m)
     metrics.update(ck_m)
     metrics.update(sp_m)
+
     DiffusionPipeline, FMEDS, CPipe, CTrans, T2D = _import_diffusers()
     if CTrans is not None:
         transformer = CTrans.from_single_file(ckpt, torch_dtype=DTYPE)
@@ -206,6 +225,7 @@ def _build_pipeline(metrics: Dict[str, Any]):
         transformer = T2D.from_single_file(ckpt, torch_dtype=DTYPE)
     else:
         raise RuntimeError("no compatible transformer class")
+
     if CPipe is not None:
         pipe = CPipe.from_pretrained(CHROMA_LOCAL_DIR, transformer=transformer, torch_dtype=DTYPE, local_files_only=True, trust_remote_code=True)
     else:
@@ -214,52 +234,206 @@ def _build_pipeline(metrics: Dict[str, Any]):
             pipe.transformer = transformer
     if FMEDS is not None and hasattr(pipe, "scheduler"):
         pipe.scheduler = FMEDS.from_config(pipe.scheduler.config)
+
     pipe.to(DEVICE, dtype=DTYPE)
     _PIPE = pipe
+    log.info("Chroma pipeline ready.")
     return _PIPE
 
-def generate_images(prompt: str, negative_prompt: Optional[str] = None, steps: int = 6, num_images: int = 1, width: Optional[int] = None, height: Optional[int] = None, guidance_scale: Optional[float] = None) -> List[Image.Image]:
-    metrics = {}
+def generate_images(
+    prompt: str,
+    negative_prompt: Optional[str] = None,
+    steps: int = 6,
+    num_images: int = 1,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    guidance_scale: Optional[float] = None,
+) -> List[Image.Image]:
     with _PIPE_LOCK:
-        pipe = _build_pipeline(metrics)
+        _build_pipeline({})
+        pipe = _PIPE
+
     gen = {"prompt": prompt, "num_inference_steps": int(steps)}
-    if negative_prompt:
-        gen["negative_prompt"] = negative_prompt
-    if guidance_scale is not None:
-        gen["guidance_scale"] = float(guidance_scale)
-    if width:
-        gen["width"] = int(width)
-    if height:
-        gen["height"] = int(height)
+    if negative_prompt: gen["negative_prompt"] = negative_prompt
+    if guidance_scale is not None: gen["guidance_scale"] = float(guidance_scale)
+    if width: gen["width"] = int(width)
+    if height: gen["height"] = int(height)
+
     out = pipe(**gen)
     images = out.images if hasattr(out, "images") else out
-    if not isinstance(images, list):
-        images = [images]
-    if num_images and len(images) > num_images:
-        images = images[:num_images]
+    if not isinstance(images, list): images = [images]
+    if num_images and len(images) > num_images: images = images[:num_images]
     return images
 
+# --------- ComfyUI graph parsing (heuristic) ---------
+def parse_comfy_prompt_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    graph = payload.get("prompt") or {}
+    prompt_text = None
+    negative_text = None
+    steps = None
+    width = None
+    height = None
+    guidance = None
+    for _, node in graph.items():
+        ctype = str(node.get("class_type", "")).lower()
+        inputs = node.get("inputs", {}) or {}
+        if "textencode" in ctype or "cliptextencode" in ctype:
+            t = inputs.get("text")
+            if isinstance(t, str):
+                if prompt_text is None:
+                    prompt_text = t
+                elif negative_text is None:
+                    negative_text = t
+        if "ksampler" in ctype:
+            if steps is None and "steps" in inputs:
+                try: steps = int(inputs["steps"])
+                except Exception: pass
+            if "cfg" in inputs and guidance is None:
+                try: guidance = float(inputs["cfg"])
+                except Exception: pass
+        if "emptylatentimage" in ctype:
+            if width is None and "width" in inputs:
+                try: width = int(inputs["width"])
+                except Exception: pass
+            if height is None and "height" in inputs:
+                try: height = int(inputs["height"])
+                except Exception: pass
+    if prompt_text is None:
+        prompt_text = payload.get("positive") or payload.get("prompt") or ""
+    if negative_text is None:
+        negative_text = payload.get("negative") or None
+    if steps is None:
+        steps = int(payload.get("steps", 6))
+    return {
+        "prompt": prompt_text,
+        "negative_prompt": negative_text,
+        "steps": steps,
+        "width": width,
+        "height": height,
+        "guidance_scale": guidance,
+        "num_images": int(payload.get("num_images", 1)),
+        "output_format": str(payload.get("output_format", "PNG")).upper()
+    }
+
+# --------- Core processing (shared by both modes) ---------
+def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
+    if input_data.get("warmup"):
+        with _PIPE_LOCK:
+            _build_pipeline({})
+        return {"status": "ok", "warmed": True}
+
+    if input_data.get("comfy"):
+        params = parse_comfy_prompt_payload(input_data.get("payload") or {})
+        if not params["prompt"]:
+            return {"status": "error", "error": "No prompt text in Comfy payload"}
+        imgs = generate_images(
+            prompt=params["prompt"],
+            negative_prompt=params["negative_prompt"],
+            steps=params["steps"],
+            num_images=params["num_images"],
+            width=params["width"],
+            height=params["height"],
+            guidance_scale=params["guidance_scale"],
+        )
+        if not _have_s3():
+            return {"status": "error", "error": "missing S3 envs"}
+        fmt = params["output_format"]
+        urls = [_upload_and_presign(im, fmt=fmt) for im in imgs]
+        pid = uuid.uuid4().hex
+        HISTORY[pid] = {"status": "completed", "outputs": {"result": {"images": [{"url": u} for u in urls]}}}
+        return {"status": "ok", "prompt_id": pid}
+
+    prompt = input_data.get("prompt")
+    if not prompt or not isinstance(prompt, str):
+        with _PIPE_LOCK:
+            _build_pipeline({})
+        return {"status": "ok", "warmed": True}
+
+    imgs = generate_images(
+        prompt=prompt,
+        negative_prompt=input_data.get("negative_prompt"),
+        steps=int(input_data.get("steps", 6)),
+        num_images=int(input_data.get("num_images", 1)),
+        width=input_data.get("width"),
+        height=input_data.get("height"),
+        guidance_scale=input_data.get("guidance_scale"),
+    )
+    if not _have_s3():
+        return {"status": "error", "error": "missing S3 envs"}
+    fmt = str(input_data.get("output_format", "PNG")).upper()
+    urls = [_upload_and_presign(im, fmt=fmt) for im in imgs]
+    return {"status": "ok", "count": len(urls), "results": [{"url": u} for u in urls]}
+
+# --------- FastAPI app (Load Balancer + ComfyUI) ---------
+app = FastAPI(title="Chroma Hybrid API", version="1.0.0")
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/queue")
+def queue_status():
+    return {"queue_remaining": 0}
+
+@app.post("/run")
+async def lb_run(req: Request):
+    """
+    Load Balancer mode entrypoint.
+    Accepts either:
+      { "input": {...} }   # same as Runpod queue body
+    or
+      { ... }              # direct input dict
+    """
+    body = await req.json()
+    input_data = body.get("input") if isinstance(body, dict) and "input" in body else body
+    out = process_input(input_data or {})
+    return JSONResponse(out)
+
+@app.post("/prompt")
+def comfy_prompt(payload: Dict[str, Any] = Body(...)):
+    params = parse_comfy_prompt_payload(payload)
+    if not params["prompt"]:
+        raise HTTPException(status_code=400, detail="No prompt text found in graph or payload.")
+    imgs = generate_images(
+        prompt=params["prompt"],
+        negative_prompt=params["negative_prompt"],
+        steps=params["steps"],
+        num_images=params["num_images"],
+        width=params["width"],
+        height=params["height"],
+        guidance_scale=params["guidance_scale"],
+    )
+    if not _have_s3():
+        raise HTTPException(status_code=500, detail="Missing S3 envs for output upload.")
+    fmt = params["output_format"]
+    urls = [_upload_and_presign(im, fmt=fmt) for im in imgs]
+    pid = uuid.uuid4().hex
+    HISTORY[pid] = {"status": "completed", "outputs": {"result": {"images": [{"url": u} for u in urls]}}}
+    return {"prompt_id": pid}
+
+@app.get("/history/{prompt_id}")
+def comfy_history(prompt_id: str):
+    item = HISTORY.get(prompt_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="prompt_id not found")
+    return {"history": {prompt_id: item}}
+
+# --------- Runpod Queue mode handler ---------
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     data = event.get("input") or {}
     try:
-        if data.get("warmup"):
-            m = {}
-            with _PIPE_LOCK:
-                _build_pipeline(m)
-            return {"status": "ok", "warmed": True, "metrics": m}
-        prompt = data.get("prompt")
-        if not prompt or not isinstance(prompt, str):
-            with _PIPE_LOCK:
-                _build_pipeline({})
-            return {"status": "ok", "warmed": True}
-        imgs = generate_images(prompt=prompt, negative_prompt=data.get("negative_prompt"), steps=int(data.get("steps", 6)), num_images=int(data.get("num_images", 1)), width=data.get("width"), height=data.get("height"), guidance_scale=data.get("guidance_scale"))
-        if not all([S3_ENDPOINT_URL, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET]):
-            return {"status": "error", "error": "missing S3 envs"}
-        fmt = str(data.get("output_format", "PNG")).upper()
-        urls = [_upload_and_presign(im, fmt=fmt) for im in imgs]
-        return {"status": "ok", "count": len(urls), "results": [{"url": u} for u in urls]}
+        return process_input(data)
     except Exception as e:
         log.exception("handler error")
         return {"status": "error", "error": str(e)}
 
+# --------- Start HTTP server in background (so both modes work) ---------
+def _start_http_server():
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+
+if ENABLE_HTTP and str(ENABLE_HTTP).strip() not in ("0","false","no","off"):
+    t = threading.Thread(target=_start_http_server, daemon=True)
+    t.start()
+
+# Queue worker (blocks main thread)
 runpod.serverless.start({"handler": handler})
