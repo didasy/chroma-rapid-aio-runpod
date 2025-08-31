@@ -6,13 +6,12 @@ import torch
 from PIL import Image
 from huggingface_hub import snapshot_download, hf_hub_download
 try:
-    from huggingface_hub.constants import HF_HUB_CACHE as HUB_CACHE_PATH_CONST  # best-effort
+    from huggingface_hub.constants import HF_HUB_CACHE as HUB_CACHE_PATH_CONST
 except Exception:
     HUB_CACHE_PATH_CONST = None
 
 import boto3
 from botocore.config import Config as BotoConfig
-from botocore.exceptions import ClientError
 
 from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.responses import JSONResponse
@@ -40,11 +39,13 @@ AIO_URL          = os.getenv("AIO_URL")
 SNAPSHOT_URL     = os.getenv("SNAPSHOT_URL")
 HF_TOKEN         = os.getenv("HF_TOKEN")
 
-HF_HOME = os.getenv("HF_HOME", os.path.join(CACHE_ROOT, "hf"))
-os.environ.setdefault("HF_HOME", HF_HOME)
-os.environ.setdefault("HUGGINGFACE_HUB_CACHE", os.getenv("HUGGINGFACE_HUB_CACHE", os.path.join(CACHE_ROOT, "hf")))
-os.environ.setdefault("HF_HUB_CACHE",          os.getenv("HF_HUB_CACHE",          os.path.join(CACHE_ROOT, "hf")))
-os.environ.setdefault("TRANSFORMERS_CACHE",    os.getenv("TRANSFORMERS_CACHE",    os.path.join(CACHE_ROOT, "hf", "transformers")))
+# Hugging Face caches (force to /cache and limit size)
+HF_HOME_DEFAULT = os.path.join(CACHE_ROOT, "hf_cache")
+os.environ.setdefault("HF_HOME", os.getenv("HF_HOME", HF_HOME_DEFAULT))
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", os.getenv("HUGGINGFACE_HUB_CACHE", HF_HOME_DEFAULT))
+os.environ.setdefault("HF_HUB_CACHE",          os.getenv("HF_HUB_CACHE",          HF_HOME_DEFAULT))
+os.environ.setdefault("TRANSFORMERS_CACHE",    os.getenv("TRANSFORMERS_CACHE",    HF_HOME_DEFAULT))
+os.environ.setdefault("HF_HUB_MAX_CACHE_SIZE", os.getenv("HF_HUB_MAX_CACHE_SIZE", "110GB"))
 
 S3_ENDPOINT_URL        = os.getenv("S3_ENDPOINT_URL")
 S3_REGION              = os.getenv("S3_REGION", "us-west-000")
@@ -183,7 +184,13 @@ def _ensure_aio(metrics: Dict[str, Any]) -> str:
     for fn in AIO_FILENAMES:
         try:
             t0 = time.time()
-            p = hf_hub_download(repo_id=AIO_REPO, filename=fn, local_dir=None, local_dir_use_symlinks=True, token=HF_TOKEN or None)
+            p = hf_hub_download(
+                repo_id=AIO_REPO,
+                filename=fn,
+                local_dir=None,
+                local_dir_use_symlinks=True,
+                token=HF_TOKEN or None,
+            )
             size = os.path.getsize(p)
             _safe_symlink(p, AIO_LOCAL_PATH)
             metrics["aio"] = {"source": "huggingface", "size_bytes": size, "seconds": time.time() - t0}
@@ -197,8 +204,10 @@ def _ensure_snapshot(metrics: Dict[str, Any]) -> str:
     if os.path.exists(mi):
         metrics["snapshot"] = {"source": "local", "size_bytes": _dir_size_bytes(CHROMA_LOCAL_DIR), "seconds": 0}
         return CHROMA_LOCAL_DIR
+
     _ensure_free_space(CACHE_ROOT, max(10.0, MIN_FREE_GB))
     os.makedirs(CHROMA_LOCAL_DIR, exist_ok=True)
+
     if SNAPSHOT_URL:
         tmp = os.path.join(CACHE_ROOT, "chroma-snapshot.tar.gz")
         t0 = time.time()
@@ -208,18 +217,29 @@ def _ensure_snapshot(metrics: Dict[str, Any]) -> str:
         os.remove(tmp)
         metrics["snapshot"] = {"source": "url", "size_bytes": size, "seconds": time.time() - t0}
         return CHROMA_LOCAL_DIR
+
     t0 = time.time()
     snapshot_download(
         repo_id=CHROMA_BASE_ID,
         local_dir=CHROMA_LOCAL_DIR,
         local_dir_use_symlinks=True,
         allow_patterns=[
-            "model_index.json","*.json","ae.safetensors",
-            "vae/*","text_encoder/*","tokenizer/*","*.safetensors"
+            "model_index.json",
+            "*.json",
+            "ae.safetensors",
+            "vae/*.json",
+            "vae/*.safetensors",
+            "text_encoder/**",
+            "tokenizer/**",
+            # NOTE: intentionally exclude transformer/unet weights; AIO provides them
         ],
-        token=HF_TOKEN or None
+        token=HF_TOKEN or None,
     )
-    metrics["snapshot"] = {"source": "huggingface", "size_bytes": _dir_size_bytes(CHROMA_LOCAL_DIR), "seconds": time.time() - t0}
+    metrics["snapshot"] = {
+        "source": "huggingface",
+        "size_bytes": _dir_size_bytes(CHROMA_LOCAL_DIR),
+        "seconds": time.time() - t0,
+    }
     return CHROMA_LOCAL_DIR
 
 # ------------------ Diffusers ------------------
@@ -247,6 +267,7 @@ def _build_pipeline(metrics: Dict[str, Any]):
     global _PIPE
     if _PIPE is not None:
         return _PIPE
+
     ck_m, sp_m = {}, {}
     ckpt = _ensure_aio(ck_m)
     _ensure_snapshot(sp_m)
@@ -254,6 +275,7 @@ def _build_pipeline(metrics: Dict[str, Any]):
     metrics.update(sp_m)
 
     DiffusionPipeline, FMEDS, CPipe, CTrans, T2D = _import_diffusers()
+
     if CTrans is not None:
         transformer = CTrans.from_single_file(ckpt, torch_dtype=DTYPE)
     elif T2D is not None:
@@ -262,11 +284,23 @@ def _build_pipeline(metrics: Dict[str, Any]):
         raise RuntimeError("no compatible transformer class")
 
     if CPipe is not None:
-        pipe = CPipe.from_pretrained(CHROMA_LOCAL_DIR, transformer=transformer, torch_dtype=DTYPE, local_files_only=True, trust_remote_code=True)
+        pipe = CPipe.from_pretrained(
+            CHROMA_LOCAL_DIR,
+            transformer=transformer,
+            torch_dtype=DTYPE,
+            local_files_only=True,
+            trust_remote_code=True,
+        )
     else:
-        pipe = DiffusionPipeline.from_pretrained(CHROMA_LOCAL_DIR, torch_dtype=DTYPE, local_files_only=True, trust_remote_code=True)
+        pipe = DiffusionPipeline.from_pretrained(
+            CHROMA_LOCAL_DIR,
+            torch_dtype=DTYPE,
+            local_files_only=True,
+            trust_remote_code=True,
+        )
         if hasattr(pipe, "transformer"):
             pipe.transformer = transformer
+
     if FMEDS is not None and hasattr(pipe, "scheduler"):
         pipe.scheduler = FMEDS.from_config(pipe.scheduler.config)
 
@@ -355,6 +389,21 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
     if input_data.get("debug"):
         return {"status": "ok", "paths": _path_report()}
 
+    if input_data.get("cleanup"):
+        removed = 0
+        hub_dir = os.environ.get("HUGGINGFACE_HUB_CACHE") or os.environ.get("HF_HUB_CACHE") or os.path.join(CACHE_ROOT, "hf_cache")
+        for p in [CHROMA_LOCAL_DIR, AIO_LOCAL_PATH, hub_dir]:
+            if not p:
+                continue
+            if os.path.islink(p) or os.path.isfile(p):
+                try:
+                    os.remove(p); removed += 1
+                except Exception:
+                    pass
+            elif os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True); removed += 1
+        return {"status": "ok", "cleanup_removed": removed, "free_gb": round(_free_gb(CACHE_ROOT), 2)}
+
     if input_data.get("warmup"):
         with _PIPE_LOCK:
             _build_pipeline({})
@@ -403,7 +452,7 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "ok", "count": len(urls), "results": [{"url": u} for u in urls]}
 
 # ------------------ FastAPI app (Load Balancer + ComfyUI) ------------------
-app = FastAPI(title="Chroma Hybrid API", version="1.1.0")
+app = FastAPI(title="Chroma Hybrid API", version="1.2.0")
 
 @app.get("/health")
 def health():
