@@ -14,6 +14,7 @@ import boto3
 from botocore.config import Config as BotoConfig
 from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s|%(levelname)s|%(message)s")
@@ -522,6 +523,11 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
 
 # ------------------ FastAPI app (Load Balancer + ComfyUI) ------------------
 app = FastAPI(title="Chroma Hybrid API", version="1.3.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8188", "http://127.0.0.1:8188", "*"],
+    allow_methods=["*"], allow_headers=["*"]
+)
 
 @app.get("/health")
 def health():
