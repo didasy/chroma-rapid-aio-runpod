@@ -10,6 +10,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     TOKENIZERS_PARALLELISM=false \
     PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True
+    CHROMA_LOCAL_DIR=/opt/chroma
+    AIO_LOCAL_PATH=/opt/aio/chroma_aio.safetensors
+    HF_HUB_OFFLINE=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git libgl1 && \
