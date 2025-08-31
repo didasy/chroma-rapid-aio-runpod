@@ -140,6 +140,16 @@ def _path_report() -> Dict[str, Any]:
     }
 
 # ------------------ S3 ------------------
+def _normalize_endpoint(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    u = url.strip()
+    # prepend scheme if missing
+    if not (u.startswith("http://") or u.startswith("https://")):
+        use_ssl = str(os.getenv("S3_USE_SSL", "1")).strip().lower() not in ("0","false","no","off")
+        u = ("https://" if use_ssl else "http://") + u
+    return u.rstrip("/")
+
 def _have_s3() -> bool:
     return all([S3_ENDPOINT_URL, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET])
 
@@ -153,7 +163,7 @@ def _s3_client():
     session = boto3.session.Session()
     return session.client(
         "s3",
-        endpoint_url=S3_ENDPOINT_URL,
+        endpoint_url=_normalize_endpoint(S3_ENDPOINT_URL),
         region_name=S3_REGION,
         aws_access_key_id=S3_ACCESS_KEY,
         aws_secret_access_key=S3_SECRET_KEY,
