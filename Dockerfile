@@ -25,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python -m pip install --upgrade pip setuptools wheel && \
     pip install --no-cache-dir \
         "huggingface_hub>=0.23" \
+        "hf_transfer>=0.1.5" \
         "diffusers>=0.31.0" \
         "transformers>=4.42.0" \
         "accelerate>=0.31.0" \
