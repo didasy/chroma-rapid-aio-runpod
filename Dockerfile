@@ -1,5 +1,6 @@
 FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1
+RUN mkdir -p /cache
 RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 ca-certificates curl && rm -rf /var/lib/apt/lists/*
 RUN python -m pip install --upgrade pip setuptools wheel && \
     pip install --no-cache-dir \
