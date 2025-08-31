@@ -13,7 +13,7 @@ except Exception:
 import boto3
 from botocore.config import Config as BotoConfig
 from fastapi import FastAPI, HTTPException, Body, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse  # <-- added StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -76,6 +76,7 @@ os.makedirs(os.path.dirname(AIO_LOCAL_PATH), exist_ok=True)
 _PIPE = None
 _PIPE_LOCK = threading.Lock()
 HISTORY: Dict[str, Dict[str, Any]] = {}
+PROGRESS: Dict[str, Dict[str, Any]] = {}  # <-- added
 
 # ------------------ Utils ------------------
 def _free_gb(path: str) -> float:
@@ -278,9 +279,6 @@ def _apply_memory_saving(pipe):
     except Exception: pass
     try: pipe.enable_vae_tiling()
     except Exception: pass
-    if LOW_VRAM:
-        try: pipe.enable_sequential_cpu_offload()
-        except Exception: pass
 
 def _build_pipeline(metrics: Dict[str, Any]):
     global _PIPE
@@ -324,7 +322,16 @@ def _build_pipeline(metrics: Dict[str, Any]):
         pipe.scheduler = FMEDS.from_config(pipe.scheduler.config)
 
     _apply_memory_saving(pipe)
-    pipe.to(DEVICE, dtype=DTYPE)
+
+    if LOW_VRAM:
+        try:
+            pipe.enable_sequential_cpu_offload()
+        except Exception:
+            pass
+        log.info("LOW_VRAM on: using sequential CPU offload (skipping pipe.to()).")
+    else:
+        pipe.to(DEVICE, dtype=DTYPE)
+
     _PIPE = pipe
     log.info("Chroma pipeline ready (dtype=%s, low_vram=%s).", DTYPE, LOW_VRAM)
     return _PIPE
@@ -390,6 +397,107 @@ def generate_images(prompt: str, negative_prompt: Optional[str] = None,
         images += more
 
     return images[:N]
+
+# ------------------ Progress helpers (added) ------------------
+def _progress_begin(pid: str, total_steps: int):
+    PROGRESS[pid] = {
+        "status": "running",
+        "step": 0,
+        "total": int(total_steps),
+        "percent": 0.0,
+        "started": time.time(),
+        "updated": time.time(),
+        "error": None,
+    }
+
+def _progress_update(pid: str, step: int, total: int):
+    rec = PROGRESS.get(pid)
+    if not rec:
+        return
+    rec["step"] = int(step)
+    rec["total"] = int(total)
+    rec["percent"] = float(step) / max(1, int(total))
+    rec["updated"] = time.time()
+
+def _progress_finish(pid: str):
+    rec = PROGRESS.get(pid)
+    if not rec:
+        return
+    rec["status"] = "completed"
+    rec["percent"] = 1.0
+    rec["updated"] = time.time()
+
+def _progress_fail(pid: str, err: str):
+    PROGRESS[pid] = {
+        "status": "error",
+        "step": 0,
+        "total": 0,
+        "percent": 0.0,
+        "started": time.time(),
+        "updated": time.time(),
+        "error": err,
+    }
+
+# ------------------ Async job runner with callback (added) ------------------
+def _run_job_async(pid: str, params: Dict[str, Any]):
+    try:
+        with _PIPE_LOCK:
+            _build_pipeline({})
+            pipe = _PIPE
+
+        prompt = params["prompt"]
+        negative_prompt = params.get("negative_prompt")
+        steps = int(params.get("steps", 6))
+        width = params.get("width")
+        height = params.get("height")
+        guidance_scale = params.get("guidance_scale")
+        seed = params.get("seed")
+        fmt = str(params.get("output_format", "PNG")).upper()
+
+        W = _round8(width if width else 768)
+        H = _round8(height if height else 768)
+
+        _progress_begin(pid, steps)
+
+        kwargs = {
+            "prompt": prompt,
+            "num_inference_steps": steps,
+            "width": W,
+            "height": H,
+        }
+        if negative_prompt:
+            kwargs["negative_prompt"] = negative_prompt
+        if guidance_scale is not None:
+            kwargs["guidance_scale"] = float(guidance_scale)
+
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=DEVICE) if torch.cuda.is_available() else torch.Generator()
+            generator = generator.manual_seed(int(seed))
+
+        def _cb(step_idx: int, timestep, latents):
+            _progress_update(pid, step_idx + 1, steps)
+
+        out = pipe(
+            **kwargs,
+            generator=generator,
+            callback=_cb,
+            callback_steps=1,
+        )
+        images = out.images if hasattr(out, "images") else out
+        if not isinstance(images, list):
+            images = [images]
+
+        if not _have_s3():
+            _progress_fail(pid, "missing S3 envs")
+            return
+        urls = [_upload_and_presign(im, fmt=fmt) for im in images]
+        HISTORY[pid] = {"status": "completed", "outputs": {"result": {"images": [{"url": u} for u in urls]}}}
+        _progress_finish(pid)
+
+    except Exception as e:
+        log.exception("async job error")
+        _progress_fail(pid, str(e))
 
 # ------------------ ComfyUI graph parsing (heuristic) ------------------
 def parse_comfy_prompt_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -526,7 +634,7 @@ app = FastAPI(title="Chroma Hybrid API", version="1.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:8188", "http://127.0.0.1:8188", "*"],
-    allow_methods=["*"], allow_headers=["*"]
+    allow_methods=["*"], allow_headers=["*"], allow_credentials=True
 )
 
 @app.get("/health")
@@ -544,27 +652,17 @@ async def lb_run(req: Request):
     out = process_input(input_data or {})
     return JSONResponse(out)
 
+# ---------- modified: make /prompt async & return prompt_id immediately ----------
 @app.post("/prompt")
 def comfy_prompt(payload: Dict[str, Any] = Body(...)):
     params = parse_comfy_prompt_payload(payload)
     if not params["prompt"]:
         raise HTTPException(status_code=400, detail="No prompt text found in graph or payload.")
-    imgs = generate_images(
-        prompt=params["prompt"],
-        negative_prompt=params["negative_prompt"],
-        steps=params["steps"],
-        num_images=params["num_images"],
-        width=params["width"],
-        height=params["height"],
-        guidance_scale=params["guidance_scale"],
-        seed=params.get("seed"),
-    )
-    if not _have_s3():
-        raise HTTPException(status_code=500, detail="Missing S3 envs for output upload.")
-    fmt = params["output_format"]
-    urls = [_upload_and_presign(im, fmt=fmt) for im in imgs]
     pid = uuid.uuid4().hex
-    HISTORY[pid] = {"status": "completed", "outputs": {"result": {"images": [{"url": u} for u in urls]}}}
+    HISTORY.pop(pid, None)
+    PROGRESS.pop(pid, None)
+    t = threading.Thread(target=_run_job_async, args=(pid, params), daemon=True)
+    t.start()
     return {"prompt_id": pid}
 
 @app.get("/history/{prompt_id}")
@@ -573,6 +671,41 @@ def comfy_history(prompt_id: str):
     if not item:
         raise HTTPException(status_code=404, detail="prompt_id not found")
     return {"history": {prompt_id: item}}
+
+# ---------- added: progress endpoints ----------
+@app.get("/progress/{prompt_id}")
+def comfy_progress(prompt_id: str):
+    rec = PROGRESS.get(prompt_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="prompt_id not found")
+    return {"prompt_id": prompt_id, "progress": rec}
+
+@app.get("/progress/stream/{prompt_id}")
+def comfy_progress_stream(prompt_id: str):
+    def event_gen():
+        last = None
+        while True:
+            rec = PROGRESS.get(prompt_id)
+            if rec is None:
+                yield f"event: gone\ndata: {prompt_id}\n\n"
+                return
+            if rec != last:
+                payload = {
+                    "prompt_id": prompt_id,
+                    "status": rec.get("status"),
+                    "step": rec.get("step"),
+                    "total": rec.get("total"),
+                    "percent": rec.get("percent"),
+                    "updated": rec.get("updated"),
+                    "error": rec.get("error"),
+                }
+                import json as _json
+                yield "data: " + _json.dumps(payload) + "\n\n"
+                last = dict(rec)
+            if rec.get("status") in ("completed", "error"):
+                return
+            time.sleep(0.5)
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 # ------------------ Runpod Queue mode handler ------------------
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
