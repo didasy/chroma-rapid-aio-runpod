@@ -24,7 +24,6 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
 WORKDIR /app
 COPY handler.py /app/handler.py
 
-# Cache to serverless volume; keep ONLINE so it can fetch on first run.
 ENV HF_HOME=/runpod-volume/hf_cache \
     HUGGINGFACE_HUB_CACHE=/runpod-volume/hf_cache \
     TRANSFORMERS_CACHE=/runpod-volume/hf_cache \

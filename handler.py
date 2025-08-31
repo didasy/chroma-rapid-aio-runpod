@@ -1,4 +1,4 @@
-import os, uuid, time, threading, logging, io, urllib.request, shutil
+import os, uuid, time, threading, logging, io, shutil, stat, urllib.request
 from typing import Any, Dict, List, Optional
 
 import runpod
@@ -11,7 +11,7 @@ import boto3
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("chroma-aio")
 
-# ---- Model/env ----
+# ---------- Model/env ----------
 HF_BASE_ID = os.getenv("CHROMA_BASE_ID", "lodestones/Chroma")
 CHROMA_LOCAL_DIR = os.getenv("CHROMA_LOCAL_DIR", "/runpod-volume/chroma")
 
@@ -22,13 +22,16 @@ AIO_FILENAMES = [
     "chroma-rapid-aio.safetensors",
 ]
 AIO_LOCAL_PATH = os.getenv("AIO_LOCAL_PATH", "/runpod-volume/chroma_aio.safetensors")
-AIO_URL = os.getenv("AIO_URL")  # optional direct URL (B2, S3, etc.)
+AIO_URL = os.getenv("AIO_URL")  # optional direct URL (B2/S3) to skip HF for the big file
+HF_TOKEN = os.getenv("HF_TOKEN")  # optional
 
-HF_TOKEN = os.getenv("HF_TOKEN")  # optional auth/rate-limit bypass
+# If you want a hard guard, require at least this much free space (GB) before downloads
+MIN_FREE_GB = float(os.getenv("MIN_FREE_GB", "50"))
+
 DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ---- S3 ----
+# ---------- S3 ----------
 S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")
 S3_REGION = os.getenv("S3_REGION", "us-west-000")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
@@ -37,7 +40,7 @@ S3_BUCKET = os.getenv("S3_BUCKET")
 S3_PREFIX = os.getenv("S3_PREFIX", "chroma/outputs/")
 S3_PRESIGN_EXPIRES = int(os.getenv("S3_PRESIGN_EXPIRES", "3600"))
 
-# ---- Lazy pipeline ----
+# ---------- Lazy pipeline ----------
 _PIPE = None
 _PIPE_LOCK = threading.Lock()
 
@@ -62,22 +65,26 @@ def _import_diffusers():
     return (DiffusionPipeline, FlowMatchEulerDiscreteScheduler,
             _ChromaPipeline, _ChromaTransformer2DModel, _Transformer2DModel)
 
-def _ensure_chroma_base_local() -> str:
-    if os.path.exists(os.path.join(CHROMA_LOCAL_DIR, "model_index.json")):
-        return CHROMA_LOCAL_DIR
-    os.makedirs(CHROMA_LOCAL_DIR, exist_ok=True)
-    log.info(f"Downloading base model: {HF_BASE_ID} -> {CHROMA_LOCAL_DIR}")
-    snapshot_download(
-        repo_id=HF_BASE_ID,
-        local_dir=CHROMA_LOCAL_DIR,
-        local_dir_use_symlinks=False,
-        allow_patterns=[
-            "model_index.json", "*.json", "ae.safetensors", "vae/*",
-            "text_encoder/*", "tokenizer/*", "*.safetensors",
-        ],
-        token=HF_TOKEN or None,
-    )
-    return CHROMA_LOCAL_DIR
+# ---------- Disk helpers ----------
+def _free_gb(path: str) -> float:
+    total, used, free = shutil.disk_usage(path)
+    return free / (1024**3)
+
+def _ensure_free_space(path: str, need_gb: float):
+    free = _free_gb(path)
+    if free < need_gb:
+        raise RuntimeError(f"Not enough free space at {path}: need {need_gb:.1f} GB, have {free:.1f} GB")
+
+def _safe_symlink(target: str, link: str):
+    # Replace link with symlink to target (no duplication). Works across filesystems.
+    if os.path.islink(link) or os.path.exists(link):
+        try:
+            os.remove(link)
+        except Exception:
+            # make writable then remove
+            os.chmod(link, stat.S_IWUSR | stat.S_IRUSR)
+            os.remove(link)
+    os.symlink(target, link)
 
 def _download_url(url: str, dst_path: str, chunk: int = 8 * 1024 * 1024):
     os.makedirs(os.path.dirname(dst_path), exist_ok=True)
@@ -90,45 +97,106 @@ def _download_url(url: str, dst_path: str, chunk: int = 8 * 1024 * 1024):
             f.write(b)
     os.replace(tmp, dst_path)
 
+# ---------- Ensure assets (with symlinks, not copies) ----------
+def _ensure_chroma_base_local() -> str:
+    mi = os.path.join(CHROMA_LOCAL_DIR, "model_index.json")
+    if os.path.exists(mi):
+        return CHROMA_LOCAL_DIR
+
+    # Guard: need space before first download (base ~18 GB; overhead a few GB)
+    _ensure_free_space(CHROMA_LOCAL_DIR, max(10.0, MIN_FREE_GB))
+
+    log.info(f"Downloading base model snapshot: {HF_BASE_ID} -> {CHROMA_LOCAL_DIR} (symlinks enabled; no copy)")
+    os.makedirs(CHROMA_LOCAL_DIR, exist_ok=True)
+    snapshot_download(
+        repo_id=HF_BASE_ID,
+        local_dir=CHROMA_LOCAL_DIR,
+        local_dir_use_symlinks=True,  # <<< key change: do NOT copy from cache
+        allow_patterns=[
+            "model_index.json",
+            "*.json",
+            "ae.safetensors",
+            "vae/*",
+            "text_encoder/*",
+            "tokenizer/*",
+            "*.safetensors",
+        ],
+        token=HF_TOKEN or None,
+    )
+    return CHROMA_LOCAL_DIR
+
 def _ensure_aio_checkpoint() -> str:
-    """Prefer AIO_URL if provided; else fetch from HF by known filenames."""
     if os.path.exists(AIO_LOCAL_PATH) and os.path.getsize(AIO_LOCAL_PATH) > 0:
         return AIO_LOCAL_PATH
+
+    # Guard: need space for the big file (14–18 GB) + a bit of overhead
+    _ensure_free_space(os.path.dirname(AIO_LOCAL_PATH), max(20.0, MIN_FREE_GB))
 
     os.makedirs(os.path.dirname(AIO_LOCAL_PATH), exist_ok=True)
 
     if AIO_URL:
-        log.info(f"Downloading AIO from URL -> {AIO_LOCAL_PATH}")
+        log.info(f"Downloading AIO via URL -> {AIO_LOCAL_PATH}")
         _download_url(AIO_URL, AIO_LOCAL_PATH)
         if os.path.getsize(AIO_LOCAL_PATH) == 0:
             raise RuntimeError("Downloaded AIO file is empty.")
         return AIO_LOCAL_PATH
 
+    # Download to HF cache, then symlink AIO_LOCAL_PATH to the cached blob (no duplicate)
     last_err = None
-    for fn in AIO_FILENAMES:
-        try:
-            log.info(f"Fetching AIO from HF: {AIO_REPO}:{fn}")
-            p = hf_hub_download(
-                repo_id=AIO_REPO,
-                filename=fn,
-                local_dir=os.path.dirname(AIO_LOCAL_PATH),
-                local_dir_use_symlinks=False,
-                token=HF_TOKEN or None,
-            )
-            if os.path.exists(p) and os.path.getsize(p) > 0:
-                if p != AIO_LOCAL_PATH:
-                    os.replace(p, AIO_LOCAL_PATH)
-                return AIO_LOCAL_PATH
-        except Exception as e:
-            last_err = e
+    try:
+        p = hf_hub_download(
+            repo_id=AIO_REPO,
+            filename=AIO_FILENAMES[0],
+            local_dir=None,                 # <<< keep in cache
+            local_dir_use_symlinks=True,    # cache manages CAS
+            token=HF_TOKEN or None,
+        )
+        if not (os.path.exists(p) and os.path.getsize(p) > 0):
+            raise RuntimeError("hf_hub_download returned empty path.")
+        _safe_symlink(p, AIO_LOCAL_PATH)
+        return AIO_LOCAL_PATH
+    except Exception as e:
+        last_err = e
+        # try alternates
+        for fn in AIO_FILENAMES[1:]:
+            try:
+                p = hf_hub_download(
+                    repo_id=AIO_REPO,
+                    filename=fn,
+                    local_dir=None,
+                    local_dir_use_symlinks=True,
+                    token=HF_TOKEN or None,
+                )
+                if os.path.exists(p) and os.path.getsize(p) > 0:
+                    _safe_symlink(p, AIO_LOCAL_PATH)
+                    return AIO_LOCAL_PATH
+            except Exception as e2:
+                last_err = e2
     raise RuntimeError(f"Failed to download AIO from HF ({AIO_FILENAMES}): {last_err}")
 
+# ---------- Build pipeline ----------
 def _build_pipeline():
     global _PIPE
     if _PIPE is not None:
         return _PIPE
 
-    DiffusionPipeline, FMEDS, CPipe, CTrans, T2D = _import_diffusers()
+    from diffusers import DiffusionPipeline
+    try:
+        from diffusers import FlowMatchEulerDiscreteScheduler as FMEDS
+    except Exception:
+        FMEDS = None
+    try:
+        from diffusers import ChromaPipeline as CPipe
+    except Exception:
+        CPipe = None
+    try:
+        from diffusers import ChromaTransformer2DModel as CTrans
+    except Exception:
+        CTrans = None
+    try:
+        from diffusers import Transformer2DModel as T2D
+    except Exception:
+        T2D = None
 
     ckpt = _ensure_aio_checkpoint()
     local_model_root = _ensure_chroma_base_local()
@@ -161,12 +229,12 @@ def _build_pipeline():
     if FMEDS is not None and hasattr(pipe, "scheduler"):
         pipe.scheduler = FMEDS.from_config(pipe.scheduler.config)
 
-    pipe.to(DEVICE, dtype=DTYPE)
+    pipe.to("cuda" if torch.cuda.is_available() else "cpu", dtype=DTYPE)
     _PIPE = pipe
     log.info("Chroma pipeline ready.")
     return _PIPE
 
-# ---- S3 helpers ----
+# ---------- S3 helpers ----------
 def _s3_client():
     if not all([S3_ENDPOINT_URL, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET]):
         raise RuntimeError("Missing S3 envs: S3_ENDPOINT_URL, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET")
@@ -188,11 +256,10 @@ def _upload_and_presign(img: Image.Image, fmt: str = "PNG") -> str:
     client = _s3_client()
     client.put_object(Bucket=S3_BUCKET, Key=key, Body=buf.getvalue(),
                       ContentType=f"image/{fmt.lower()}")
-    return client.generate_presigned_url(
-        "get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=S3_PRESIGN_EXPIRES
-    )
+    return client.generate_presigned_url("get_object",
+        Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=S3_PRESIGN_EXPIRES)
 
-# ---- Inference ----
+# ---------- Inference ----------
 def generate_images(prompt: str, negative_prompt: Optional[str] = None,
                     steps: int = 6, num_images: int = 1,
                     width: Optional[int] = None, height: Optional[int] = None,
@@ -212,15 +279,31 @@ def generate_images(prompt: str, negative_prompt: Optional[str] = None,
     if num_images and len(images) > num_images: images = images[:num_images]
     return images
 
-# ---- Runpod handler ----
+# ---------- Runpod handler ----------
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     data = event.get("input") or {}
     try:
+        # Maintenance ops
+        if data.get("cleanup"):
+            removed = 0
+            for p in [
+                "/runpod-volume/chroma",
+                "/runpod-volume/chroma_aio.safetensors",
+                "/runpod-volume/hf_cache",
+            ]:
+                if os.path.islink(p) or os.path.isfile(p):
+                    os.remove(p); removed += 1
+                elif os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True); removed += 1
+            return {"status": "ok", "cleanup_removed": removed,
+                    "free_gb": round(_free_gb("/runpod-volume"), 2)}
+
         if data.get("warmup"):
-            # Pre-download assets; returns when ready
+            before = _free_gb("/runpod-volume")
             _ensure_aio_checkpoint()
             _ensure_chroma_base_local()
-            return {"status": "ok", "warmed": True}
+            after = _free_gb("/runpod-volume")
+            return {"status": "ok", "warmed": True, "free_gb_before": round(before,2), "free_gb_after": round(after,2)}
 
         prompt = data.get("prompt")
         if not prompt or not isinstance(prompt, str):
@@ -239,6 +322,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         fmt = str(data.get("output_format", "PNG")).upper()
         urls = [_upload_and_presign(im, fmt=fmt) for im in imgs]
         return {"status": "ok", "count": len(urls), "results": [{"url": u} for u in urls]}
+
     except Exception as e:
         log.exception("Handler error")
         return {"status": "error", "error": str(e)}
