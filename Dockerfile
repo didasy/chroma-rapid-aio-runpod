@@ -1,6 +1,7 @@
-# CUDA 12.6 + cuDNN 9 + PyTorch 2.6
+# CUDA 12.6 + cuDNN 9 + PyTorch 2.6 (Runpod-friendly)
 FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime
 
+# ---------- Base env & caches ----------
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     HF_HOME=/weights/huggingface \
@@ -9,34 +10,37 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DIFFUSERS_CACHE=/weights/huggingface \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     TOKENIZERS_PARALLELISM=false \
-    PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True \
-    CHROMA_LOCAL_DIR=/opt/chroma \
-    AIO_LOCAL_PATH=/opt/aio/chroma_aio.safetensors \
-    HF_HUB_OFFLINE=1
+    PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True
 
+# ---------- System deps ----------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git libgl1 && \
+    git \
+    libgl1 \
+    libglib2.0-0 \
+    ffmpeg \
+    ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Core libs + hf_transfer (fixes previous build error) + S3 client + runpod
-RUN python -m pip install --upgrade pip && pip install \
-    "diffusers==0.35.1" \
-    "transformers>=4.44.2,<4.46" \
-    "accelerate>=1.0.0" \
-    "huggingface_hub>=0.34.4" \
-    "safetensors>=0.4.5" \
-    "sentencepiece>=0.2.0" \
-    "pillow>=10.4.0" \
-    "boto3>=1.34.0" \
-    "runpod>=1.6.0" \
-    "hf_transfer>=0.1.5"
+# ---------- Python deps ----------
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir \
+        "huggingface_hub>=0.23" \
+        "diffusers>=0.31.0" \
+        "transformers>=4.42.0" \
+        "accelerate>=0.31.0" \
+        "safetensors>=0.4.3" \
+        "Pillow>=10.3.0" \
+        runpod \
+        boto3 \
+        botocore
 
-# Deterministic, baked-in locations
-RUN mkdir -p /opt/chroma /opt/aio /app /weights/hf /weights/huggingface
+# ---------- Folders ----------
+RUN mkdir -p /weights/huggingface /opt/chroma /opt/aio /app
 WORKDIR /app
 
-# --- Snapshot Chroma base (PUBLIC) ---
-RUN python - <<'PY'
+# ---------- Download/bake model assets (network ON only for these RUN lines) ----------
+# Chroma base snapshot (lodestones/Chroma) → /opt/chroma
+RUN HF_HUB_OFFLINE=0 python - <<'PY'
 from huggingface_hub import snapshot_download
 snapshot_download(
     repo_id="lodestones/Chroma",
@@ -49,37 +53,60 @@ snapshot_download(
         "vae/*",
         "text_encoder/*",
         "tokenizer/*",
-        "*.safetensors",
+        "*.safetensors"
     ],
 )
 print("Chroma snapshot -> /opt/chroma")
 PY
 
-# --- Snapshot AIO transformer weights (PUBLIC) ---
-RUN python - <<'PY'
-import os, glob, shutil
-from huggingface_hub import snapshot_download
-tmp="/opt/aio_src"; dst="/opt/aio"; os.makedirs(dst, exist_ok=True)
-snapshot_download(
-    repo_id="Phr00t/Chroma-Rapid-AIO",
-    local_dir=tmp,
-    local_dir_use_symlinks=False,
-    allow_patterns=["Chroma-Rapid-AIO-v2.safetensors","Chroma-Rapid-AIO.safetensors"],
-)
-cands=glob.glob(os.path.join(tmp, "*.safetensors"))
-if not cands:
-    raise SystemExit("No AIO .safetensors downloaded")
-best=max(cands, key=lambda p: os.path.getsize(p))
-shutil.copy2(best, os.path.join(dst, "chroma_aio.safetensors"))
+# AIO checkpoint (Phr00t/Chroma-Rapid-AIO) → /opt/aio/chroma_aio.safetensors
+# Try a few known filenames; keep the largest successfully fetched.
+RUN HF_HUB_OFFLINE=0 python - <<'PY'
+import os, shutil, tempfile
+from huggingface_hub import hf_hub_download
+
+repo = "Phr00t/Chroma-Rapid-AIO"
+candidates = [
+    "Chroma-Rapid-AIO-v2.safetensors",
+    "Chroma-Rapid-AIO.safetensors",
+    "chroma-rapid-aio.safetensors",
+]
+tmp = tempfile.mkdtemp()
+downloaded = []
+for fn in candidates:
+    try:
+        p = hf_hub_download(repo_id=repo, filename=fn, local_dir=tmp, local_dir_use_symlinks=False)
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            downloaded.append(p)
+    except Exception:
+        pass
+
+if not downloaded:
+    raise SystemExit("Failed to download any AIO checkpoint from Phr00t/Chroma-Rapid-AIO")
+
+dst_dir = "/opt/aio"
+os.makedirs(dst_dir, exist_ok=True)
+best = max(downloaded, key=lambda p: os.path.getsize(p))
+shutil.copy2(best, os.path.join(dst_dir, "chroma_aio.safetensors"))
 shutil.rmtree(tmp, ignore_errors=True)
 print("AIO checkpoint -> /opt/aio/chroma_aio.safetensors")
 PY
 
-# Optional: trim hub caches
-RUN rm -rf /root/.cache/huggingface
+# ---------- Sanity checks (fail build early if assets missing) ----------
+RUN test -f /opt/chroma/model_index.json && \
+    test -f /opt/aio/chroma_aio.safetensors
 
-# App
+# ---------- Runtime env (offline + baked paths) ----------
+ENV CHROMA_LOCAL_DIR=/opt/chroma \
+    AIO_LOCAL_PATH=/opt/aio/chroma_aio.safetensors \
+    HF_HUB_OFFLINE=1
+
+# (Optional) Backblaze S3 defaults — keep secrets in the template, not in the image
+ENV S3_ENDPOINT_URL=https://s3.us-west-000.backblazeb2.com \
+    S3_REGION=us-west-000
+
+# ---------- App ----------
 COPY handler.py /app/handler.py
 
-# Runtime is fully offline; handler loads from /opt/chroma and /opt/aio/chroma_aio.safetensors
+# ---------- Entrypoint ----------
 CMD ["python", "-u", "handler.py"]
