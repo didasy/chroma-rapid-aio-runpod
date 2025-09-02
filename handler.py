@@ -130,6 +130,76 @@ def _upload_and_presign(img: Image.Image, fmt: str = "PNG") -> str:
     c.put_object(Bucket=S3_BUCKET, Key=key, Body=buf.getvalue(), **extra)
     return c.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=S3_PRESIGN_EXPIRES)
 
+# ------------------ Assets ------------------
+def _ensure_aio(metrics: Dict[str, Any]) -> str:
+    """
+    Ensure the monolithic AIO weights file exists at AIO_LOCAL_PATH.
+    Try: existing file -> CHROMA_LOCAL_DIR candidates -> AIO_URL -> AIO_REPO (HF) -> fallback copy.
+    """
+    # If already present (and sane size), use it.
+    if os.path.exists(AIO_LOCAL_PATH) and os.path.getsize(AIO_LOCAL_PATH) > 1_000_000:
+        metrics["aio"] = {"source": "local", "size_bytes": os.path.getsize(AIO_LOCAL_PATH)}
+        return AIO_LOCAL_PATH
+
+    t0 = time.time()
+    # Try local filenames in CHROMA_LOCAL_DIR
+    for fname in AIO_FILENAMES:
+        p = os.path.join(CHROMA_LOCAL_DIR, fname)
+        if os.path.exists(p) and os.path.getsize(p) > 1_000_000:
+            shutil.copy2(p, AIO_LOCAL_PATH)
+            metrics["aio"] = {"source": "repo", "fname": fname, "size_bytes": os.path.getsize(AIO_LOCAL_PATH), "seconds": time.time() - t0}
+            return AIO_LOCAL_PATH
+
+    # Direct URL (if given)
+    if AIO_URL:
+        try:
+            with urllib.request.urlopen(AIO_URL) as r, open(AIO_LOCAL_PATH, "wb") as f:
+                shutil.copyfileobj(r, f)
+            metrics["aio"] = {"source": "url", "size_bytes": os.path.getsize(AIO_LOCAL_PATH), "seconds": time.time() - t0}
+            return AIO_LOCAL_PATH
+        except Exception as e:
+            log.warning("AIO_URL download failed: %s", e)
+
+    # HF hub download via AIO_REPO (env) if provided
+    if AIO_REPO:
+        for fname in AIO_FILENAMES:
+            try:
+                hp = hf_hub_download(repo_id=AIO_REPO, filename=fname, token=HF_TOKEN or None)
+                shutil.copy2(hp, AIO_LOCAL_PATH)
+                metrics["aio"] = {"source": "hf_hub", "repo": AIO_REPO, "fname": fname, "size_bytes": os.path.getsize(AIO_LOCAL_PATH), "seconds": time.time() - t0}
+                return AIO_LOCAL_PATH
+            except Exception:
+                continue
+
+    # Must have a populated CHROMA_LOCAL_DIR by now
+    if not (os.path.isdir(CHROMA_LOCAL_DIR) and os.listdir(CHROMA_LOCAL_DIR)):
+        raise RuntimeError("CHROMA_LOCAL_DIR is empty; snapshot failed or missing.")
+
+    # Last-ditch: copy any matching filename from repo dir
+    for fname in AIO_FILENAMES:
+        p = os.path.join(CHROMA_LOCAL_DIR, fname)
+        if os.path.exists(p):
+            shutil.copy2(p, AIO_LOCAL_PATH)
+            metrics["aio"] = {"source": "repo", "fname": fname, "size_bytes": os.path.getsize(AIO_LOCAL_PATH), "seconds": time.time() - t0}
+            return AIO_LOCAL_PATH
+
+    raise RuntimeError("AIO tensor not found (checked local path, repo dir, AIO_URL, AIO_REPO).")
+
+def _path_report():
+    return {
+        "cache_root": CACHE_ROOT,
+        "hf_home": os.environ.get("HF_HOME"),
+        "hf_hub_cache": os.environ.get("HUGGINGFACE_HUB_CACHE"),
+        "hf_hub_cache_const": HUB_CACHE_PATH_CONST,
+        "transformers_cache": os.environ.get("TRANSFORMERS_CACHE"),
+        "chroma_local_dir": CHROMA_LOCAL_DIR,
+        "aio_local_path": AIO_LOCAL_PATH,
+        "free_gb_cache_root": round(_free_gb(CACHE_ROOT), 2),
+        "free_gb_rootfs": round(_free_gb("/"), 2),
+        "dtype": str(DTYPE),
+        "low_vram": LOW_VRAM,
+    }
+
 # ------------------ Snapshot / Repo ------------------
 def _ensure_repo(metrics: Dict[str, Any]) -> str:
     # If directory already has content, trust it.
@@ -463,7 +533,7 @@ def generate_images(prompt: str, negative_prompt: Optional[str] = None,
 
 # ------------------ Progress / Async ------------------
 def _progress_begin(pid: str, total_steps: int):
-    PROGRESS[pid] = {"status": "running","step": 0,"total": total_steps,"percent": 0.0,"started": time.time(),"updated": time.time()}
+    PROGRESS[pid] = {"status": "running","step": 0,"total": 0 if total_steps is None else total_steps,"percent": 0.0,"started": time.time(),"updated": time.time()}
 
 def _progress_update(pid: str, step: int, total: int):
     rec = PROGRESS.get(pid) or {}
@@ -692,7 +762,7 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "ok", "count": len(urls), "results": [{"url": u} for u in urls]}
 
 # ------------------ FastAPI app ------------------
-app = FastAPI(title="Chroma Hybrid API", version="1.3.1")
+app = FastAPI(title="Chroma Hybrid API", version="1.3.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:8188", "http://127.0.0.1:8188", "*"],
