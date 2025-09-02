@@ -363,6 +363,22 @@ def _set_scheduler(pipe, name: Optional[str]):
     new_sched = mapping.get(n)
     if new_sched is not None:
         pipe.scheduler = new_sched
+    
+    try:
+        _orig = pipe.scheduler.set_timesteps
+        def _set_timesteps_compat(num_inference_steps, device=None, **kwargs):
+            kwargs.pop("mu", None)  # FlowMatch-only; breaks on Euler/Euler-A/etc.
+            # Euler-A also can't take custom 'sigmas' via kwargs
+            try:
+                from diffusers.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteScheduler
+                if isinstance(pipe.scheduler, EulerAncestralDiscreteScheduler):
+                    kwargs.pop("sigmas", None)
+            except Exception:
+                pass
+            return _orig(num_inference_steps, device=device, **kwargs)
+        pipe.scheduler.set_timesteps = _set_timesteps_compat
+    except Exception:
+        pass
 
 def _apply_noise_schedule(pipe, schedule_name: Optional[str]):
     if not schedule_name: return
@@ -374,12 +390,28 @@ def _apply_noise_schedule(pipe, schedule_name: Optional[str]):
     if s == "karras":
         cfg_dict["use_karras_sigmas"] = True
     elif s == "normal":
-        cfg_dict["use_karras_sigmas"] = cfg_dict.get("use_karras_sigmas", False)
+        cfg_dict["use_karras_sigmas"] = False
         cfg_dict["use_exponential_sigmas"] = False
     elif s == "exponential":
         cfg_dict["use_exponential_sigmas"] = True
     try:
         pipe.scheduler = type(sched).from_config(cfg_dict)
+
+        try:
+            _orig = pipe.scheduler.set_timesteps
+            def _set_timesteps_compat(num_inference_steps, device=None, **kwargs):
+                kwargs.pop("mu", None)  # FlowMatch-only; breaks on Euler/Euler-A/etc.
+                # Euler-A also can't take custom 'sigmas' via kwargs
+                try:
+                    from diffusers.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteScheduler
+                    if isinstance(pipe.scheduler, EulerAncestralDiscreteScheduler):
+                        kwargs.pop("sigmas", None)
+                except Exception:
+                    pass
+                return _orig(num_inference_steps, device=device, **kwargs)
+            pipe.scheduler.set_timesteps = _set_timesteps_compat
+        except Exception:
+            pass
     except Exception:
         pass
 
