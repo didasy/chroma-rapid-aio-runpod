@@ -275,11 +275,20 @@ try:
     )
 
     class _EulerCompatMixin:
-        def set_timesteps(self, num_inference_steps, device=None, **kwargs):
-            # Drop FlowMatch/Karras extras that some pipelines pass through
+        def set_timesteps(self, *args, **kwargs):
+            # Accept & drop extras whether passed positionally or by name
             kwargs.pop("sigmas", None)
             kwargs.pop("mu", None)
-            return super().set_timesteps(num_inference_steps, device=device)
+            # Trim any extra positional args beyond (num_steps, device)
+            if len(args) > 2:
+                args = args[:2]
+            # Clear any pre-set schedule attribute that could confuse logic
+            try:
+                if hasattr(self, "sigmas"):
+                    self.sigmas = None
+            except Exception:
+                pass
+            return super().set_timesteps(*args, **kwargs)
 
     class EulerDiscreteSchedulerCompat(_EulerCompatMixin, _EulerDiscreteScheduler):
         pass
@@ -350,8 +359,29 @@ def _parse_size(s: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
     except Exception:
         return None, None
 
+def _patch_set_timesteps(pipe):
+    """Instance-level patch: tolerate stray 'sigmas'/'mu' and extra positionals."""
+    try:
+        _orig = pipe.scheduler.set_timesteps
+    except Exception:
+        return
+    def _compat(*args, **kwargs):
+        kwargs.pop("sigmas", None)
+        kwargs.pop("mu", None)
+        if len(args) > 2:
+            args = args[:2]
+        try:
+            if hasattr(pipe.scheduler, "sigmas"):
+                pipe.scheduler.sigmas = None
+        except Exception:
+            pass
+        return _orig(*args, **kwargs)
+    pipe.scheduler.set_timesteps = _compat
+
 def _set_scheduler(pipe, name: Optional[str]):
-    if not name: return
+    if not name: 
+        _patch_set_timesteps(pipe)  # still patch to be safe
+        return
     try:
         from diffusers import (
             PNDMScheduler, LMSDiscreteScheduler, EulerDiscreteScheduler, EulerAncestralDiscreteScheduler,
@@ -362,9 +392,12 @@ def _set_scheduler(pipe, name: Optional[str]):
         try: from diffusers import FlowMatchEulerDiscreteScheduler as FMEDS  # optional
         except Exception: FMEDS = None
     except Exception:
+        _patch_set_timesteps(pipe)
         return
     cfg = getattr(pipe.scheduler, "config", None)
-    if cfg is None: return
+    if cfg is None:
+        _patch_set_timesteps(pipe)
+        return
     n = str(name).strip().lower()
     def _mk(Cls):
         try: return Cls.from_config(cfg) if Cls else None
@@ -397,31 +430,20 @@ def _set_scheduler(pipe, name: Optional[str]):
     new_sched = mapping.get(n)
     if new_sched is not None:
         pipe.scheduler = new_sched
-    
-    # compat wrapper (kept for extra safety)
-    try:
-        _orig = pipe.scheduler.set_timesteps
-        def _set_timesteps_compat(num_inference_steps, device=None, **kwargs):
-            kwargs.pop("mu", None)  # FlowMatch-only; breaks on Euler/Euler-A/etc.
-            # Euler & Euler-A don't accept custom 'sigmas'
-            try:
-                from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler
-                from diffusers.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteScheduler
-                if isinstance(pipe.scheduler, (EulerDiscreteScheduler, EulerAncestralDiscreteScheduler)):
-                    kwargs.pop("sigmas", None)
-            except Exception:
-                pass
-            return _orig(num_inference_steps, device=device, **kwargs)
-        pipe.scheduler.set_timesteps = _set_timesteps_compat
-    except Exception:
-        pass
+
+    # instance-level patch (handles any later calls)
+    _patch_set_timesteps(pipe)
 
 def _apply_noise_schedule(pipe, schedule_name: Optional[str]):
-    if not schedule_name: return
+    if not schedule_name:
+        _patch_set_timesteps(pipe)
+        return
     s = str(schedule_name).strip().lower()
     sched = getattr(pipe, "scheduler", None)
     cfg = getattr(sched, "config", None)
-    if sched is None or cfg is None: return
+    if sched is None or cfg is None:
+        _patch_set_timesteps(pipe)
+        return
     cfg_dict = dict(cfg.__dict__)
     if s == "karras":
         cfg_dict["use_karras_sigmas"] = True
@@ -432,26 +454,10 @@ def _apply_noise_schedule(pipe, schedule_name: Optional[str]):
         cfg_dict["use_exponential_sigmas"] = True
     try:
         pipe.scheduler = type(sched).from_config(cfg_dict)
-
-        # re-apply compat wrapper after re-instantiation
-        try:
-            _orig = pipe.scheduler.set_timesteps
-            def _set_timesteps_compat(num_inference_steps, device=None, **kwargs):
-                kwargs.pop("mu", None)  # FlowMatch-only; breaks on Euler/Euler-A/etc.
-                # Euler & Euler-A don't accept custom 'sigmas'
-                try:
-                    from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler
-                    from diffusers.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteScheduler
-                    if isinstance(pipe.scheduler, (EulerDiscreteScheduler, EulerAncestralDiscreteScheduler)):
-                        kwargs.pop("sigmas", None)
-                except Exception:
-                    pass
-                return _orig(num_inference_steps, device=device, **kwargs)
-            pipe.scheduler.set_timesteps = _set_timesteps_compat
-        except Exception:
-            pass
     except Exception:
         pass
+    # re-apply instance-level patch after re-instantiation
+    _patch_set_timesteps(pipe)
 
 def _read_init_image(val: Optional[str]) -> Optional[Image.Image]:
     if not val or not isinstance(val, str): return None
@@ -533,7 +539,7 @@ def generate_images(prompt: str, negative_prompt: Optional[str] = None,
 
 # ------------------ Progress / Async ------------------
 def _progress_begin(pid: str, total_steps: int):
-    PROGRESS[pid] = {"status": "running","step": 0,"total": 0 if total_steps is None else total_steps,"percent": 0.0,"started": time.time(),"updated": time.time()}
+    PROGRESS[pid] = {"status": "running","step": 0,"total": total_steps,"percent": 0.0,"started": time.time(),"updated": time.time()}
 
 def _progress_update(pid: str, step: int, total: int):
     rec = PROGRESS.get(pid) or {}
@@ -594,8 +600,7 @@ def _run_job_async(pid: str, params: Dict[str, Any]):
         if not isinstance(images, list): images = [images]
 
         if not _have_s3():
-            _progress_fail(pid, "missing S3 envs")
-            return
+            _progress_fail(pid, "missing S3 envs"); return
         urls = [_upload_and_presign(im, fmt=fmt) for im in images]
         HISTORY[pid] = {"status": "completed", "outputs": {"result": {"images": [{"url": u} for u in urls]}}}
         _progress_finish(pid)
@@ -762,7 +767,7 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "ok", "count": len(urls), "results": [{"url": u} for u in urls]}
 
 # ------------------ FastAPI app ------------------
-app = FastAPI(title="Chroma Hybrid API", version="1.3.2")
+app = FastAPI(title="Chroma Hybrid API", version="1.3.3")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:8188", "http://127.0.0.1:8188", "*"],
