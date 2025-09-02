@@ -1,4 +1,4 @@
-import os, io, time, uuid, stat, tarfile, shutil, logging, threading, urllib.request, base64, inspect
+import os, io, time, uuid, tarfile, shutil, logging, threading, urllib.request, base64, inspect
 from typing import Any, Dict, List, Optional, Tuple
 
 import runpod
@@ -12,8 +12,8 @@ except Exception:
 
 import boto3
 from botocore.config import Config as BotoConfig
-from fastapi import FastAPI, HTTPException, Body, Request
-from fastapi.responses import JSONResponse, StreamingResponse  # <-- added StreamingResponse
+from fastapi import FastAPI, HTTPException, Body
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -23,26 +23,32 @@ log = logging.getLogger("chroma")
 
 # ------------------ Runtime config ------------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-LOW_VRAM = str(os.environ.get("LOW_VRAM", "0")).strip().lower() in ("1", "true", "yes", "on")
-DTYPE  = torch.bfloat16 if str(os.getenv("DTYPE", "bf16")).lower() in ("bf16","bfloat16") else torch.float16
+
+def _truthy(v: Optional[str]) -> bool:
+    return str(v or "").strip().lower() in ("1","true","yes","on")
+
+FORCE_FP16 = _truthy(os.getenv("FORCE_FP16"))
+LOW_VRAM   = _truthy(os.getenv("LOW_VRAM"))
+_dt_env    = str(os.getenv("DTYPE", "bf16")).lower()
+DTYPE      = torch.float16 if (FORCE_FP16 or _dt_env in ("fp16","float16")) else torch.bfloat16
 
 CACHE_ROOT = os.environ.get("CACHE_ROOT", "/cache")
 os.makedirs(CACHE_ROOT, exist_ok=True)
 
-PORT = int(os.getenv("PORT", "8000"))
-ENABLE_HTTP = os.getenv("ENABLE_HTTP", "1")
+PORT        = int(os.getenv("PORT", "8000"))
+ENABLE_HTTP = not _truthy(os.getenv("ENABLE_HTTP", "1")) is False  # default on
+
+MIN_FREE_GB = float(os.getenv("MIN_FREE_GB", "0"))
 
 # ------------------ Globals ------------------
 _PIPE_LOCK = threading.Lock()
-_PIPE = None
-
+_PIPE: Optional[object] = None
 HISTORY: Dict[str, Any] = {}
 PROGRESS: Dict[str, Any] = {}
 
 def _free_gb(path="/"):
     try:
-        st = os.statvfs(path)
-        return st.f_bavail * st.f_frsize / (1024**3)
+        st = os.statvfs(path); return st.f_bavail * st.f_frsize / (1024**3)
     except Exception:
         return 0.0
 
@@ -57,10 +63,11 @@ def _dir_size_bytes(root):
     return total
 
 # ------------------ Model paths ------------------
-CHROMA_LOCAL_DIR = os.path.join(CACHE_ROOT, "chroma_repo")
+CHROMA_LOCAL_DIR = os.getenv("CHROMA_LOCAL_DIR", os.path.join(CACHE_ROOT, "chroma_repo"))
+os.makedirs(CHROMA_LOCAL_DIR, exist_ok=True)
 CHROMA_REVISION  = os.getenv("CHROMA_REVISION", None)
 
-AIO_FILENAMES  = [
+AIO_FILENAMES = [
     os.getenv("AIO_FILENAME_PRI", "Chroma-Rapid-AIO-v2.safetensors"),
     os.getenv("AIO_FILENAME_ALT", "Chroma-Rapid-AIO.safetensors"),
     "chroma-rapid-aio.safetensors",
@@ -69,78 +76,64 @@ AIO_LOCAL_PATH = os.getenv("AIO_LOCAL_PATH", os.path.join(CACHE_ROOT, "chroma_ai
 AIO_URL        = os.getenv("AIO_URL")
 SNAPSHOT_URL   = os.getenv("SNAPSHOT_URL")
 HF_TOKEN       = os.getenv("HF_TOKEN")
+AIO_REPO       = os.getenv("AIO_REPO")  # present in your .env
 
-# Hugging Face caches (force to /cache and limit size)
+# Hugging Face caches (respect your env first)
 HF_HOME_DEFAULT = os.path.join(CACHE_ROOT, "hf_cache")
 os.environ.setdefault("HF_HOME", os.getenv("HF_HOME", HF_HOME_DEFAULT))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", os.getenv("HUGGINGFACE_HUB_CACHE", HF_HOME_DEFAULT))
 os.environ.setdefault("HF_HUB_CACHE", os.getenv("HF_HUB_CACHE", HF_HOME_DEFAULT))
 os.environ.setdefault("TRANSFORMERS_CACHE", os.getenv("TRANSFORMERS_CACHE", HF_HOME_DEFAULT))
 
-# ------------------ Device / Mem helpers ------------------
-def _apply_memory_saving(pipe):
-    try:
-        pipe.enable_vae_slicing()
-    except Exception:
-        pass
-    try:
-        pipe.enable_vae_tiling()
-    except Exception:
-        pass
-    try:
-        pipe.enable_model_cpu_offload()  # newer diffusers
-    except Exception:
-        pass
-
 # ------------------ S3 ------------------
 def _normalize_endpoint(url: Optional[str]) -> Optional[str]:
     if not url:
         return None
     u = url.strip()
-    # prepend scheme if missing
     if not (u.startswith("http://") or u.startswith("https://")):
-        use_ssl = str(os.getenv("S3_USE_SSL", "1")).strip().lower() not in ("0","false","no","off")
+        use_ssl = not _truthy(os.getenv("S3_USE_SSL", "1")) is False
         u = ("https://" if use_ssl else "http://") + u
     return u
 
-S3_ENDPOINT = _normalize_endpoint(os.environ.get("S3_ENDPOINT"))
-S3_REGION   = os.environ.get("S3_REGION")
-S3_KEY      = os.environ.get("S3_KEY")
-S3_SECRET   = os.environ.get("S3_SECRET")
-S3_BUCKET   = os.environ.get("S3_BUCKET")
-S3_PREFIX   = os.environ.get("S3_PREFIX", "outputs")
-S3_PRESIGN_EXPIRES = int(os.environ.get("S3_PRESIGN_EXPIRES", "21600"))
-S3_CONTENT_DISPOSITION = os.environ.get("S3_CONTENT_DISPOSITION", "")
+_env = os.environ
+S3_ENDPOINT = _normalize_endpoint(_env.get("S3_ENDPOINT") or _env.get("S3_ENDPOINT_URL"))
+S3_REGION   = _env.get("S3_REGION")
+S3_KEY      = _env.get("S3_KEY") or _env.get("S3_ACCESS_KEY")
+S3_SECRET   = _env.get("S3_SECRET") or _env.get("S3_SECRET_KEY")
+S3_BUCKET   = _env.get("S3_BUCKET")
+S3_PREFIX   = _env.get("S3_PREFIX", "outputs")
+S3_PRESIGN_EXPIRES = int(_env.get("S3_PRESIGN_EXPIRES", "21600"))
+S3_CONTENT_DISPOSITION = _env.get("S3_CONTENT_DISPOSITION", "")
+S3_VERIFY_SSL = not _truthy(_env.get("S3_VERIFY_SSL", "1")) is False
 
 def _have_s3():
     return all([S3_ENDPOINT, S3_KEY, S3_SECRET, S3_BUCKET])
 
 def _s3_client():
-    cfg = {
-        "aws_access_key_id": S3_KEY,
-        "aws_secret_access_key": S3_SECRET,
-        "endpoint_url": S3_ENDPOINT,
-        "region_name": S3_REGION or "us-east-1",
-        "config": BotoConfig(signature_version="s3v4", retries={"max_attempts": 3}),
-    }
+    cfg = dict(
+        aws_access_key_id=S3_KEY,
+        aws_secret_access_key=S3_SECRET,
+        endpoint_url=S3_ENDPOINT,
+        region_name=S3_REGION or "us-east-1",
+        config=BotoConfig(signature_version="s3v4", retries={"max_attempts": 3}),
+        verify=S3_VERIFY_SSL,
+    )
     return boto3.client("s3", **cfg)
 
 def _upload_and_presign(img: Image.Image, fmt: str = "PNG") -> str:
     key = f"{S3_PREFIX.rstrip('/')}/{int(time.time())}-{uuid.uuid4().hex}.{fmt.lower()}".lstrip("/")
-    buf = io.BytesIO()
-    img.save(buf, format=fmt)
-    buf.seek(0)
+    buf = io.BytesIO(); img.save(buf, format=fmt); buf.seek(0)
     c = _s3_client()
     extra = {"ContentType": f"image/{fmt.lower()}"}
-    cd = S3_CONTENT_DISPOSITION.strip()
-    if cd:
-        extra["ContentDisposition"] = cd
+    if S3_CONTENT_DISPOSITION.strip():
+        extra["ContentDisposition"] = S3_CONTENT_DISPOSITION.strip()
     c.put_object(Bucket=S3_BUCKET, Key=key, Body=buf.getvalue(), **extra)
     return c.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=S3_PRESIGN_EXPIRES)
 
-# ------------------ Assets (download to CACHE_ROOT) ------------------
+# ------------------ Assets ------------------
 def _ensure_aio(metrics: Dict[str, Any]) -> str:
-    if os.path.exists(AIO_LOCAL_PATH) and os.path.getsize(AIO_LOCAL_PATH) > 1024 * 1024:
+    # If already present (and sane size), use it.
+    if os.path.exists(AIO_LOCAL_PATH) and os.path.getsize(AIO_LOCAL_PATH) > 1_000_000:
         metrics["aio"] = {"source": "local", "size_bytes": os.path.getsize(AIO_LOCAL_PATH)}
         return AIO_LOCAL_PATH
 
@@ -148,12 +141,12 @@ def _ensure_aio(metrics: Dict[str, Any]) -> str:
     # Try local filenames in CHROMA_LOCAL_DIR
     for fname in AIO_FILENAMES:
         p = os.path.join(CHROMA_LOCAL_DIR, fname)
-        if os.path.exists(p) and os.path.getsize(p) > 1024 * 1024:
+        if os.path.exists(p) and os.path.getsize(p) > 1_000_000:
             shutil.copy2(p, AIO_LOCAL_PATH)
             metrics["aio"] = {"source": "repo", "fname": fname, "size_bytes": os.path.getsize(AIO_LOCAL_PATH), "seconds": time.time() - t0}
             return AIO_LOCAL_PATH
 
-    # Direct URL
+    # Direct URL (if given)
     if AIO_URL:
         try:
             with urllib.request.urlopen(AIO_URL) as r, open(AIO_LOCAL_PATH, "wb") as f:
@@ -163,10 +156,22 @@ def _ensure_aio(metrics: Dict[str, Any]) -> str:
         except Exception as e:
             log.warning("AIO_URL download failed: %s", e)
 
-    # HF hub download (repo snapshot must exist already)
-    if not os.path.isdir(CHROMA_LOCAL_DIR) or not os.listdir(CHROMA_LOCAL_DIR):
+    # HF hub download via AIO_REPO (env) if provided
+    if AIO_REPO:
+        for fname in AIO_FILENAMES:
+            try:
+                hp = hf_hub_download(repo_id=AIO_REPO, filename=fname, token=HF_TOKEN or None)
+                shutil.copy2(hp, AIO_LOCAL_PATH)
+                metrics["aio"] = {"source": "hf_hub", "repo": AIO_REPO, "fname": fname, "size_bytes": os.path.getsize(AIO_LOCAL_PATH), "seconds": time.time() - t0}
+                return AIO_LOCAL_PATH
+            except Exception:
+                continue
+
+    # Must have a populated CHROMA_LOCAL_DIR by now
+    if not (os.path.isdir(CHROMA_LOCAL_DIR) and os.listdir(CHROMA_LOCAL_DIR)):
         raise RuntimeError("CHROMA_LOCAL_DIR is empty; snapshot failed or missing.")
 
+    # Last-ditch: copy any matching filename from repo dir
     for fname in AIO_FILENAMES:
         p = os.path.join(CHROMA_LOCAL_DIR, fname)
         if os.path.exists(p):
@@ -174,7 +179,7 @@ def _ensure_aio(metrics: Dict[str, Any]) -> str:
             metrics["aio"] = {"source": "repo", "fname": fname, "size_bytes": os.path.getsize(AIO_LOCAL_PATH), "seconds": time.time() - t0}
             return AIO_LOCAL_PATH
 
-    raise RuntimeError("AIO tensor not found.")
+    raise RuntimeError("AIO tensor not found (checked local path, repo dir, AIO_URL, AIO_REPO).")
 
 def _path_report():
     return {
@@ -191,28 +196,19 @@ def _path_report():
         "low_vram": LOW_VRAM,
     }
 
-# ------------------ S3 ------------------
-def _normalize_endpoint(url: Optional[str]) -> Optional[str]:
-    if not url:
-        return None
-    u = url.strip()
-    # prepend scheme if missing
-    if not (u.startswith("http://") or u.startswith("https://")):
-        use_ssl = str(os.getenv("S3_USE_SSL", "1")).strip().lower() not in ("0","false","no","off")
-        u = ("https://" if use_ssl else "http://") + u
-    return u
-
 # ------------------ Snapshot / Repo ------------------
 def _ensure_repo(metrics: Dict[str, Any]) -> str:
+    # If directory already has content, trust it.
     if os.path.isdir(CHROMA_LOCAL_DIR) and os.listdir(CHROMA_LOCAL_DIR):
-        metrics["snapshot"] = {
-            "source": "cached",
-            "size_bytes": _dir_size_bytes(CHROMA_LOCAL_DIR),
-        }
+        metrics["snapshot"] = {"source": "cached", "size_bytes": _dir_size_bytes(CHROMA_LOCAL_DIR)}
         return CHROMA_LOCAL_DIR
 
+    if MIN_FREE_GB and _free_gb(CACHE_ROOT) < MIN_FREE_GB:
+        log.warning("Low free space: %.2f GB < MIN_FREE_GB=%.2f", _free_gb(CACHE_ROOT), MIN_FREE_GB)
+
     t0 = time.time()
-    # Allow both SNAPSHOT_URL and the hub snapshot
+
+    # Tarball snapshot URL (if provided)
     if SNAPSHOT_URL:
         tar_path = os.path.join(CACHE_ROOT, "snapshot.tar")
         with urllib.request.urlopen(SNAPSHOT_URL) as r, open(tar_path, "wb") as f:
@@ -220,15 +216,11 @@ def _ensure_repo(metrics: Dict[str, Any]) -> str:
         with tarfile.open(tar_path, "r") as tar:
             tar.extractall(CHROMA_LOCAL_DIR)
         os.remove(tar_path)
-        metrics["snapshot"] = {
-            "source": "url",
-            "size_bytes": _dir_size_bytes(CHROMA_LOCAL_DIR),
-            "seconds": time.time() - t0,
-        }
+        metrics["snapshot"] = {"source": "url", "size_bytes": _dir_size_bytes(CHROMA_LOCAL_DIR), "seconds": time.time() - t0}
         return CHROMA_LOCAL_DIR
 
-    # Fall back to hub snapshot
-    repo_id = os.getenv("CHROMA_REPO", "Phr00t/Chroma-Rapid-AIO")
+    # Hugging Face repo snapshot (use your CHROMA_BASE_ID first)
+    repo_id = os.getenv("CHROMA_BASE_ID") or os.getenv("CHROMA_REPO") or "lodestones/Chroma"
     snapshot_download(
         repo_id=repo_id,
         revision=CHROMA_REVISION,
@@ -241,17 +233,13 @@ def _ensure_repo(metrics: Dict[str, Any]) -> str:
             "scheduler/**",
             "safety_checker/**",
             "feature_extractor/**",
+            "image_processor/**",
             "text_encoder/**",
             "tokenizer/**",
-            # NOTE: intentionally exclude transformer/unet weights; AIO provides them
         ],
         token=HF_TOKEN or None,
     )
-    metrics["snapshot"] = {
-        "source": "huggingface",
-        "size_bytes": _dir_size_bytes(CHROMA_LOCAL_DIR),
-        "seconds": time.time() - t0,
-    }
+    metrics["snapshot"] = {"source": "huggingface", "repo": repo_id, "size_bytes": _dir_size_bytes(CHROMA_LOCAL_DIR), "seconds": time.time() - t0}
     return CHROMA_LOCAL_DIR
 
 # ------------------ Diffusers ------------------
@@ -275,6 +263,11 @@ def _import_diffusers():
         T2D = None
     return DiffusionPipeline, FlowMatchEulerDiscreteScheduler, CPipe, CTrans, T2D
 
+def _apply_memory_saving(pipe):
+    for fn in ("enable_vae_slicing","enable_vae_tiling","enable_model_cpu_offload"):
+        try: getattr(pipe, fn)()
+        except Exception: pass
+
 def _build_pipeline(metrics: Dict[str, Any]):
     global _PIPE
     if _PIPE is not None:
@@ -286,55 +279,30 @@ def _build_pipeline(metrics: Dict[str, Any]):
 
     # Build transformer from AIO weights
     if CTrans is not None:
-        transformer = CTrans.from_single_file(
-            AIO_LOCAL_PATH,
-            torch_dtype=DTYPE,
-            low_cpu_mem_usage=True,
-        )
+        transformer = CTrans.from_single_file(AIO_LOCAL_PATH, torch_dtype=DTYPE, low_cpu_mem_usage=True)
     else:
-        # fallback: generic Transformer2DModel
         if T2D is None:
             raise RuntimeError("No available Transformer2DModel to load AIO.")
-        transformer = T2D.from_single_file(
-            AIO_LOCAL_PATH,
-            torch_dtype=DTYPE,
-            low_cpu_mem_usage=True,
-        )
+        transformer = T2D.from_single_file(AIO_LOCAL_PATH, torch_dtype=DTYPE, low_cpu_mem_usage=True)
 
     # Build pipeline with local snapshot
     if CPipe is not None:
-        pipe = CPipe.from_pretrained(
-            CHROMA_LOCAL_DIR,
-            transformer=transformer,
-            torch_dtype=DTYPE,
-            local_files_only=True,
-            trust_remote_code=True,
-        )
+        pipe = CPipe.from_pretrained(CHROMA_LOCAL_DIR, transformer=transformer, torch_dtype=DTYPE, local_files_only=True, trust_remote_code=True)
     else:
-        pipe = DiffusionPipeline.from_pretrained(
-            CHROMA_LOCAL_DIR,
-            torch_dtype=DTYPE,
-            local_files_only=True,
-            trust_remote_code=True,
-        )
+        pipe = DiffusionPipeline.from_pretrained(CHROMA_LOCAL_DIR, torch_dtype=DTYPE, local_files_only=True, trust_remote_code=True)
         if hasattr(pipe, "transformer"):
             pipe.transformer = transformer
 
-    # Optionally swap to FlowMatch Euler if present
+    # Optional FlowMatch Euler
     if FMEDS is not None and hasattr(pipe, "scheduler"):
-        try:
-            pipe.scheduler = FMEDS.from_config(pipe.scheduler.config)
-        except Exception:
-            pass
+        try: pipe.scheduler = FMEDS.from_config(pipe.scheduler.config)
+        except Exception: pass
 
     _apply_memory_saving(pipe)
-
     if LOW_VRAM:
-        try:
-            pipe.enable_sequential_cpu_offload()
-        except Exception:
-            pass
-        log.info("LOW_VRAM on: using sequential CPU offload (skipping pipe.to()).")
+        try: pipe.enable_sequential_cpu_offload()
+        except Exception: pass
+        log.info("LOW_VRAM on: sequential CPU offload.")
     else:
         pipe.to(DEVICE, dtype=DTYPE)
 
@@ -342,23 +310,19 @@ def _build_pipeline(metrics: Dict[str, Any]):
     log.info("Chroma pipeline ready (dtype=%s, low_vram=%s).", DTYPE, LOW_VRAM)
     return _PIPE
 
-# ------------------ Inference ------------------
+# ------------------ Helpers ------------------
 def _round8(x: int) -> int:
     return max(64, int(x // 8) * 8)
 
 def _parse_size(s: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
     if not s or not isinstance(s, str): return None, None
     try:
-        w, h = s.lower().split("x")
-        return _round8(int(w)), _round8(int(h))
+        w, h = s.lower().split("x"); return _round8(int(w)), _round8(int(h))
     except Exception:
         return None, None
 
-# ------------------ Scheduler / Noise-schedule helpers (added) ------------------
 def _set_scheduler(pipe, name: Optional[str]):
-    """Map sampler/algorithm name (e.g. euler_a, dpmpp_2m) to a diffusers scheduler."""
-    if not name:
-        return
+    if not name: return
     try:
         from diffusers import (
             PNDMScheduler, LMSDiscreteScheduler, EulerDiscreteScheduler, EulerAncestralDiscreteScheduler,
@@ -366,24 +330,19 @@ def _set_scheduler(pipe, name: Optional[str]):
             DDIMScheduler, DEISMultistepScheduler, DDPMScheduler,
             DPMSolverMultistepScheduler, DPMSolverSinglestepScheduler, UniPCMultistepScheduler,
         )
-        try:
-            from diffusers import FlowMatchEulerDiscreteScheduler as FMEDS  # optional
-        except Exception:
-            FMEDS = None
+        try: from diffusers import FlowMatchEulerDiscreteScheduler as FMEDS  # optional
+        except Exception: FMEDS = None
     except Exception:
         return
     cfg = getattr(pipe.scheduler, "config", None)
-    if cfg is None:
-        return
+    if cfg is None: return
     n = str(name).strip().lower()
     def _mk(Cls):
-        try:
-            return Cls.from_config(cfg) if Cls else None
-        except Exception:
-            return None
+        try: return Cls.from_config(cfg) if Cls else None
+        except Exception: return None
     mapping = {
         "pndm": _mk(PNDMScheduler),
-        "plms": _mk(PNDMScheduler),  # approx
+        "plms": _mk(PNDMScheduler),
         "lms": _mk(LMSDiscreteScheduler),
         "heun": _mk(HeunDiscreteScheduler),
         "euler": _mk(EulerDiscreteScheduler),
@@ -406,45 +365,38 @@ def _set_scheduler(pipe, name: Optional[str]):
         pipe.scheduler = new_sched
 
 def _apply_noise_schedule(pipe, schedule_name: Optional[str]):
-    """Apply noise schedule tweaks like 'karras' or 'exponential' when supported by current scheduler."""
-    if not schedule_name:
-        return
+    if not schedule_name: return
     s = str(schedule_name).strip().lower()
     sched = getattr(pipe, "scheduler", None)
     cfg = getattr(sched, "config", None)
-    if sched is None or cfg is None:
-        return
+    if sched is None or cfg is None: return
     cfg_dict = dict(cfg.__dict__)
     if s == "karras":
         cfg_dict["use_karras_sigmas"] = True
     elif s == "normal":
-        # reset to defaults if flags exist
-        if "use_karras_sigmas" in cfg_dict: cfg_dict["use_karras_sigmas"] = False
-        if "use_exponential_sigmas" in cfg_dict: cfg_dict["use_exponential_sigmas"] = False
+        cfg_dict["use_karras_sigmas"] = cfg_dict.get("use_karras_sigmas", False)
+        cfg_dict["use_exponential_sigmas"] = False
     elif s == "exponential":
         cfg_dict["use_exponential_sigmas"] = True
-    # other names are no-ops for diffusers; keep compatibility with callers
     try:
         pipe.scheduler = type(sched).from_config(cfg_dict)
     except Exception:
         pass
 
 def _read_init_image(val: Optional[str]) -> Optional[Image.Image]:
-    """Decode init image from URL, data URI, or raw base64. Returns PIL.Image or None."""
-    if not val or not isinstance(val, str):
-        return None
+    if not val or not isinstance(val, str): return None
     try:
-        if val.startswith("http://") or val.startswith("https://"):
+        if val.startswith(("http://","https://")):
             with urllib.request.urlopen(val) as r:
                 return Image.open(io.BytesIO(r.read())).convert("RGB")
         if val.startswith("data:"):
             b64 = val.split(",", 1)[1]
             return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
-        # assume raw base64
         return Image.open(io.BytesIO(base64.b64decode(val))).convert("RGB")
     except Exception:
         return None
 
+# ------------------ Inference ------------------
 def generate_images(prompt: str, negative_prompt: Optional[str] = None,
                     steps: int = 6, num_images: int = 1,
                     width: Optional[int] = None, height: Optional[int] = None,
@@ -458,7 +410,6 @@ def generate_images(prompt: str, negative_prompt: Optional[str] = None,
         _build_pipeline({})
         pipe = _PIPE
 
-    # Apply sampler (algorithm) and optional noise schedule
     _set_scheduler(pipe, sampler_name)
     _apply_noise_schedule(pipe, scheduler)
 
@@ -476,18 +427,13 @@ def generate_images(prompt: str, negative_prompt: Optional[str] = None,
     if negative_prompt: base_kwargs["negative_prompt"] = negative_prompt
     if guidance_scale is not None: base_kwargs["guidance_scale"] = float(guidance_scale)
 
-    # img2img support and denoise strength if the pipeline accepts them
     allowed = set(inspect.signature(pipe.__call__).parameters.keys())
     if init_image is not None:
-        if "image" in allowed:
-            base_kwargs["image"] = init_image
-        elif "init_image" in allowed:
-            base_kwargs["init_image"] = init_image
+        if "image" in allowed: base_kwargs["image"] = init_image
+        elif "init_image" in allowed: base_kwargs["init_image"] = init_image
     if denoise is not None:
-        if "strength" in allowed:
-            base_kwargs["strength"] = float(denoise)
-        elif "denoise" in allowed:
-            base_kwargs["denoise"] = float(denoise)
+        if "strength" in allowed: base_kwargs["strength"] = float(denoise)
+        elif "denoise" in allowed: base_kwargs["denoise"] = float(denoise)
 
     def _single(gen_seed: Optional[int]):
         gen = torch.Generator(device=DEVICE) if torch.cuda.is_available() else torch.Generator()
@@ -497,7 +443,6 @@ def generate_images(prompt: str, negative_prompt: Optional[str] = None,
         imgs = out.images if hasattr(out, "images") else out
         return imgs if isinstance(imgs, list) else [imgs]
 
-    images: List[Image.Image] = []
     try:
         images = _single(seed)
     except RuntimeError as e:
@@ -516,52 +461,29 @@ def generate_images(prompt: str, negative_prompt: Optional[str] = None,
 
     return images[:N]
 
-# ------------------ Progress helpers (added) ------------------
+# ------------------ Progress / Async ------------------
 def _progress_begin(pid: str, total_steps: int):
-    PROGRESS[pid] = {
-        "status": "running",
-        "step": 0,
-        "total": total_steps,
-        "percent": 0.0,
-        "started": time.time(),
-        "updated": time.time(),
-    }
+    PROGRESS[pid] = {"status": "running","step": 0,"total": total_steps,"percent": 0.0,"started": time.time(),"updated": time.time()}
 
 def _progress_update(pid: str, step: int, total: int):
     rec = PROGRESS.get(pid) or {}
-    rec["status"] = "running"
-    rec["step"] = step
-    rec["total"] = total
-    rec["percent"] = float(step) / float(total) if total else 0.0
-    rec["updated"] = time.time()
+    rec.update({"status": "running","step": step,"total": total,"percent": float(step)/float(total) if total else 0.0,"updated": time.time()})
     PROGRESS[pid] = rec
 
 def _progress_finish(pid: str):
     rec = PROGRESS.get(pid) or {}
-    rec["status"] = "completed"
-    rec["percent"] = 1.0
-    rec["updated"] = time.time()
+    rec.update({"status": "completed","percent": 1.0,"updated": time.time()})
     PROGRESS[pid] = rec
 
 def _progress_fail(pid: str, err: str):
-    PROGRESS[pid] = {
-        "status": "error",
-        "step": 0,
-        "total": 0,
-        "percent": 0.0,
-        "started": time.time(),
-        "updated": time.time(),
-        "error": err,
-    }
+    PROGRESS[pid] = {"status": "error","step": 0,"total": 0,"percent": 0.0,"started": time.time(),"updated": time.time(),"error": err}
 
-# ------------------ Async job runner with callback (added) ------------------
 def _run_job_async(pid: str, params: Dict[str, Any]):
     try:
         with _PIPE_LOCK:
             _build_pipeline({})
             pipe = _PIPE
 
-        # Apply sampler and noise schedule for async path (Comfy)
         _set_scheduler(pipe, params.get("sampler_name") or params.get("scheduler"))
         _apply_noise_schedule(pipe, params.get("scheduler"))
 
@@ -577,16 +499,9 @@ def _run_job_async(pid: str, params: Dict[str, Any]):
         W = _round8(width if width else 768)
         H = _round8(height if height else 768)
 
-        kwargs = {
-            "prompt": prompt,
-            "num_inference_steps": steps,
-            "width": W,
-            "height": H,
-        }
-        if negative_prompt:
-            kwargs["negative_prompt"] = negative_prompt
-        if guidance_scale is not None:
-            kwargs["guidance_scale"] = float(guidance_scale)
+        kwargs = {"prompt": prompt,"num_inference_steps": steps,"width": W,"height": H}
+        if negative_prompt: kwargs["negative_prompt"] = negative_prompt
+        if guidance_scale is not None: kwargs["guidance_scale"] = float(guidance_scale)
 
         _progress_begin(pid, steps)
 
@@ -598,23 +513,15 @@ def _run_job_async(pid: str, params: Dict[str, Any]):
         def _cb(step_idx: int, timestep, latents):
             _progress_update(pid, step_idx + 1, steps)
 
-        # pass denoise/strength if supported in async path
         allowed = set(inspect.signature(pipe.__call__).parameters.keys())
         if params.get("denoise") is not None:
             dn = float(params["denoise"])
-            if "strength" in allowed:
-                kwargs["strength"] = dn
-            elif "denoise" in allowed:
-                kwargs["denoise"] = dn
-        out = pipe(
-            **kwargs,
-            generator=generator,
-            callback=_cb,
-            callback_steps=1,
-        )
+            if "strength" in allowed: kwargs["strength"] = dn
+            elif "denoise" in allowed: kwargs["denoise"] = dn
+
+        out = pipe(**kwargs, generator=generator, callback=_cb, callback_steps=1)
         images = out.images if hasattr(out, "images") else out
-        if not isinstance(images, list):
-            images = [images]
+        if not isinstance(images, list): images = [images]
 
         if not _have_s3():
             _progress_fail(pid, "missing S3 envs")
@@ -627,40 +534,28 @@ def _run_job_async(pid: str, params: Dict[str, Any]):
         log.exception("async job error")
         _progress_fail(pid, str(e))
 
-# ------------------ ComfyUI graph parsing (heuristic) ------------------
+# ------------------ ComfyUI-ish parsing ------------------
 def parse_comfy_prompt_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     graph = payload.get("prompt") or {}
-    prompt_text = None
-    negative_text = None
-    steps = None
-    width = None
-    height = None
-    guidance = None
-    sampler_name = None
-    denoise = None
+    prompt_text = negative_text = None
+    steps = width = height = guidance = None
+    sampler_name = denoise = None
     for _, node in graph.items():
         ctype = str(node.get("class_type", "")).lower()
         inputs = node.get("inputs", {}) or {}
         if "sampler_name" in inputs and isinstance(inputs.get("sampler_name"), str):
             sampler_name = inputs["sampler_name"]
         if "denoise" in inputs:
-            try:
-                denoise = float(inputs["denoise"])  # may be 0..1
-            except Exception:
-                pass
-        if "textencode" in ctype or "cliptextencode" in ctype:
+            try: denoise = float(inputs["denoise"])
+            except Exception: pass
+        if "text" in inputs and ("textencode" in ctype or "cliptextencode" in ctype):
             t = inputs.get("text")
             if isinstance(t, str):
-                if prompt_text is None:
-                    prompt_text = t
-                else:
-                    # treat another as negative if not already set
-                    if negative_text is None:
-                        negative_text = t
+                if prompt_text is None: prompt_text = t
+                elif negative_text is None: negative_text = t
         if "neg" in ctype and negative_text is None:
             nt = inputs.get("text")
-            if isinstance(nt, str):
-                negative_text = nt
+            if isinstance(nt, str): negative_text = nt
         if "ksampler" in ctype:
             if steps is None and "steps" in inputs:
                 try: steps = int(inputs["steps"])
@@ -669,15 +564,12 @@ def parse_comfy_prompt_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
                 try: guidance = float(inputs["cfg"])
                 except Exception: pass
         if "image" in inputs and width is None and height is None:
-            # some graphs include size in a node
             try:
-                w = inputs.get("width")
-                h = inputs.get("height")
+                w = inputs.get("width"); h = inputs.get("height")
                 if isinstance(w, int) and isinstance(h, int):
                     width, height = int(w), int(h)
             except Exception:
                 pass
-
     if width is None or height is None:
         w, h = _parse_size(payload.get("size"))
         if w: width = w
@@ -701,7 +593,7 @@ def parse_comfy_prompt_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "denoise": denoise if denoise is not None else payload.get("denoise"),
     }
 
-# ------------------ Core processing (shared by both modes) ------------------
+# ------------------ Core processing ------------------
 def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
     if input_data.get("debug"):
         return {"status": "ok", "paths": _path_report()}
@@ -710,18 +602,13 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
         removed = 0
         hub_dir = os.environ.get("HUGGINGFACE_HUB_CACHE") or os.environ.get("HF_HUB_CACHE") or os.path.join(CACHE_ROOT, "hf_cache")
         for p in [CHROMA_LOCAL_DIR, AIO_LOCAL_PATH, hub_dir]:
-            if not p:
-                continue
+            if not p: continue
             if os.path.islink(p) or os.path.isfile(p):
-                try:
-                    os.remove(p); removed += 1
-                except Exception:
-                    pass
+                try: os.remove(p); removed += 1
+                except Exception: pass
             elif os.path.isdir(p):
-                try:
-                    shutil.rmtree(p, ignore_errors=True); removed += 1
-                except Exception:
-                    pass
+                try: shutil.rmtree(p, ignore_errors=True); removed += 1
+                except Exception: pass
         return {"status": "ok", "cleanup_removed": removed, "free_gb": round(_free_gb(CACHE_ROOT), 2)}
 
     if input_data.get("warmup"):
@@ -729,8 +616,6 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
             _build_pipeline({})
         return {"status": "ok", "warmed": True}
 
-    # --- Flexible request keys ---
-    prompt = input_data.get("prompt")
     if input_data.get("size") and (not input_data.get("width") or not input_data.get("height")):
         w, h = _parse_size(input_data.get("size"))
         if w: input_data["width"] = w
@@ -745,16 +630,11 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
         if not params["prompt"]:
             return {"status": "error", "error": "No prompt text in Comfy payload"}
         imgs = generate_images(
-            prompt=params["prompt"],
-            negative_prompt=params["negative_prompt"],
-            steps=params["steps"],
-            num_images=params["num_images"],
-            width=params["width"],
-            height=params["height"],
-            guidance_scale=params["guidance_scale"],
-            seed=params.get("seed"),
-            sampler_name=params.get("sampler_name"),
-            denoise=params.get("denoise"),
+            prompt=params["prompt"], negative_prompt=params["negative_prompt"],
+            steps=params["steps"], num_images=params["num_images"],
+            width=params["width"], height=params["height"],
+            guidance_scale=params["guidance_scale"], seed=params.get("seed"),
+            sampler_name=params.get("sampler_name"), denoise=params.get("denoise"),
         )
         if not _have_s3():
             return {"status": "error", "error": "missing S3 envs"}
@@ -764,14 +644,13 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
         HISTORY[pid] = {"status": "completed", "outputs": {"result": {"images": [{"url": u} for u in urls]}}}
         return {"status": "ok", "count": len(urls), "results": [{"url": u} for u in urls]}
 
+    prompt = input_data.get("prompt")
     if not prompt:
         return {"status": "error", "error": "Missing 'prompt'."}
 
     if input_data.get("sse"):
-        # start async job and stream progress
         prompt_id = uuid.uuid4().hex
-        params = dict(input_data)
-        params["prompt"] = prompt
+        params = dict(input_data); params["prompt"] = prompt
         t = threading.Thread(target=_run_job_async, args=(prompt_id, params), daemon=True)
         t.start()
 
@@ -780,23 +659,14 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
             while True:
                 rec = PROGRESS.get(prompt_id)
                 if rec is None:
-                    yield f"event: gone\ndata: {prompt_id}\n\n"
-                    return
+                    yield f"event: gone\ndata: {prompt_id}\n\n"; return
                 if rec != last:
-                    payload = {
-                        "prompt_id": prompt_id,
-                        "status": rec.get("status"),
-                        "step": rec.get("step"),
-                        "total": rec.get("total"),
-                        "percent": rec.get("percent"),
-                        "updated": rec.get("updated"),
-                        "error": rec.get("error"),
-                    }
+                    payload = {k: rec.get(k) for k in ("status","step","total","percent","updated","error")}
+                    payload["prompt_id"] = prompt_id
                     import json as _json
                     yield "data: " + _json.dumps(payload) + "\n\n"
                     last = dict(rec)
-                if rec.get("status") in ("completed", "error"):
-                    return
+                if rec.get("status") in ("completed", "error"): return
                 time.sleep(0.5)
         return StreamingResponse(event_gen(), media_type="text/event-stream")
 
@@ -821,8 +691,8 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
     urls = [_upload_and_presign(im, fmt=fmt) for im in imgs]
     return {"status": "ok", "count": len(urls), "results": [{"url": u} for u in urls]}
 
-# ------------------ FastAPI app (Load Balancer + ComfyUI) ------------------
-app = FastAPI(title="Chroma Hybrid API", version="1.3.0")
+# ------------------ FastAPI app ------------------
+app = FastAPI(title="Chroma Hybrid API", version="1.3.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:8188", "http://127.0.0.1:8188", "*"],
@@ -848,18 +718,15 @@ def http_run(input_data: Dict[str, Any] = Body(...)):
     except HTTPException:
         raise
     except Exception as e:
-        log.exception("http_run error")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.exception("http_run error"); raise HTTPException(status_code=500, detail=str(e))
 
-# ---------- modified: make /prompt async & return prompt_id immediately ----------
 @app.post("/prompt")
 def comfy_prompt(payload: Dict[str, Any] = Body(...)):
     params = parse_comfy_prompt_payload(payload)
     if not params["prompt"]:
         raise HTTPException(status_code=400, detail="No prompt text found in graph or payload.")
     pid = uuid.uuid4().hex
-    HISTORY.pop(pid, None)
-    PROGRESS.pop(pid, None)
+    HISTORY.pop(pid, None); PROGRESS.pop(pid, None)
     t = threading.Thread(target=_run_job_async, args=(pid, params), daemon=True)
     t.start()
     return {"prompt_id": pid}
@@ -867,8 +734,7 @@ def comfy_prompt(payload: Dict[str, Any] = Body(...)):
 @app.get("/history/{prompt_id}")
 def comfy_history(prompt_id: str):
     rec = HISTORY.get(prompt_id)
-    if not rec:
-        raise HTTPException(status_code=404, detail="not found")
+    if not rec: raise HTTPException(status_code=404, detail="not found")
     return rec
 
 @app.get("/progress/{prompt_id}")
@@ -882,23 +748,14 @@ def comfy_sse(prompt_id: str):
         while True:
             rec = PROGRESS.get(prompt_id)
             if rec is None:
-                yield f"event: gone\ndata: {prompt_id}\n\n"
-                return
+                yield f"event: gone\ndata: {prompt_id}\n\n"; return
             if rec != last:
-                payload = {
-                    "prompt_id": prompt_id,
-                    "status": rec.get("status"),
-                    "step": rec.get("step"),
-                    "total": rec.get("total"),
-                    "percent": rec.get("percent"),
-                    "updated": rec.get("updated"),
-                    "error": rec.get("error"),
-                }
+                payload = {k: rec.get(k) for k in ("status","step","total","percent","updated","error")}
+                payload["prompt_id"] = prompt_id
                 import json as _json
                 yield "data: " + _json.dumps(payload) + "\n\n"
                 last = dict(rec)
-            if rec.get("status") in ("completed", "error"):
-                return
+            if rec.get("status") in ("completed", "error"): return
             time.sleep(0.5)
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
@@ -911,13 +768,12 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         log.exception("handler error")
         return {"status": "error", "error": str(e)}
 
-# ------------------ Start HTTP server in background (so both modes work) ------------------
+# ------------------ Start HTTP server in background ------------------
 def _start_http_server():
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
 
-if ENABLE_HTTP and str(ENABLE_HTTP).strip().lower() not in ("0","false","no","off"):
-    t = threading.Thread(target=_start_http_server, daemon=True)
-    t.start()
+if ENABLE_HTTP:
+    threading.Thread(target=_start_http_server, daemon=True).start()
 
 # Queue worker (blocks main thread)
 runpod.serverless.start({"handler": handler})
