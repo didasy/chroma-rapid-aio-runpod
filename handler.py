@@ -130,72 +130,6 @@ def _upload_and_presign(img: Image.Image, fmt: str = "PNG") -> str:
     c.put_object(Bucket=S3_BUCKET, Key=key, Body=buf.getvalue(), **extra)
     return c.generate_presigned_url("get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=S3_PRESIGN_EXPIRES)
 
-# ------------------ Assets ------------------
-def _ensure_aio(metrics: Dict[str, Any]) -> str:
-    # If already present (and sane size), use it.
-    if os.path.exists(AIO_LOCAL_PATH) and os.path.getsize(AIO_LOCAL_PATH) > 1_000_000:
-        metrics["aio"] = {"source": "local", "size_bytes": os.path.getsize(AIO_LOCAL_PATH)}
-        return AIO_LOCAL_PATH
-
-    t0 = time.time()
-    # Try local filenames in CHROMA_LOCAL_DIR
-    for fname in AIO_FILENAMES:
-        p = os.path.join(CHROMA_LOCAL_DIR, fname)
-        if os.path.exists(p) and os.path.getsize(p) > 1_000_000:
-            shutil.copy2(p, AIO_LOCAL_PATH)
-            metrics["aio"] = {"source": "repo", "fname": fname, "size_bytes": os.path.getsize(AIO_LOCAL_PATH), "seconds": time.time() - t0}
-            return AIO_LOCAL_PATH
-
-    # Direct URL (if given)
-    if AIO_URL:
-        try:
-            with urllib.request.urlopen(AIO_URL) as r, open(AIO_LOCAL_PATH, "wb") as f:
-                shutil.copyfileobj(r, f)
-            metrics["aio"] = {"source": "url", "size_bytes": os.path.getsize(AIO_LOCAL_PATH), "seconds": time.time() - t0}
-            return AIO_LOCAL_PATH
-        except Exception as e:
-            log.warning("AIO_URL download failed: %s", e)
-
-    # HF hub download via AIO_REPO (env) if provided
-    if AIO_REPO:
-        for fname in AIO_FILENAMES:
-            try:
-                hp = hf_hub_download(repo_id=AIO_REPO, filename=fname, token=HF_TOKEN or None)
-                shutil.copy2(hp, AIO_LOCAL_PATH)
-                metrics["aio"] = {"source": "hf_hub", "repo": AIO_REPO, "fname": fname, "size_bytes": os.path.getsize(AIO_LOCAL_PATH), "seconds": time.time() - t0}
-                return AIO_LOCAL_PATH
-            except Exception:
-                continue
-
-    # Must have a populated CHROMA_LOCAL_DIR by now
-    if not (os.path.isdir(CHROMA_LOCAL_DIR) and os.listdir(CHROMA_LOCAL_DIR)):
-        raise RuntimeError("CHROMA_LOCAL_DIR is empty; snapshot failed or missing.")
-
-    # Last-ditch: copy any matching filename from repo dir
-    for fname in AIO_FILENAMES:
-        p = os.path.join(CHROMA_LOCAL_DIR, fname)
-        if os.path.exists(p):
-            shutil.copy2(p, AIO_LOCAL_PATH)
-            metrics["aio"] = {"source": "repo", "fname": fname, "size_bytes": os.path.getsize(AIO_LOCAL_PATH), "seconds": time.time() - t0}
-            return AIO_LOCAL_PATH
-
-    raise RuntimeError("AIO tensor not found (checked local path, repo dir, AIO_URL, AIO_REPO).")
-
-def _path_report():
-    return {
-        "cache_root": CACHE_ROOT,
-        "hf_home": os.environ.get("HF_HOME"),
-        "hf_hub_cache": os.environ.get("HUGGINGFACE_HUB_CACHE"),
-        "hf_hub_cache_const": HUB_CACHE_PATH_CONST,
-        "transformers_cache": os.environ.get("TRANSFORMERS_CACHE"),
-        "chroma_local_dir": CHROMA_LOCAL_DIR,
-        "aio_local_path": AIO_LOCAL_PATH,
-        "free_gb_cache_root": round(_free_gb(CACHE_ROOT), 2),
-        "free_gb_rootfs": round(_free_gb("/"), 2),
-        "dtype": str(DTYPE),
-        "low_vram": LOW_VRAM,
-    }
-
 # ------------------ Snapshot / Repo ------------------
 def _ensure_repo(metrics: Dict[str, Any]) -> str:
     # If directory already has content, trust it.
@@ -262,6 +196,31 @@ def _import_diffusers():
     except Exception:
         T2D = None
     return DiffusionPipeline, FlowMatchEulerDiscreteScheduler, CPipe, CTrans, T2D
+
+# --- Euler compat: ignore unsupported kwargs ('sigmas', 'mu') in set_timesteps ---
+try:
+    from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler as _EulerDiscreteScheduler
+    from diffusers.schedulers.scheduling_euler_ancestral_discrete import (
+        EulerAncestralDiscreteScheduler as _EulerAncestralDiscreteScheduler
+    )
+
+    class _EulerCompatMixin:
+        def set_timesteps(self, num_inference_steps, device=None, **kwargs):
+            # Drop FlowMatch/Karras extras that some pipelines pass through
+            kwargs.pop("sigmas", None)
+            kwargs.pop("mu", None)
+            return super().set_timesteps(num_inference_steps, device=device)
+
+    class EulerDiscreteSchedulerCompat(_EulerCompatMixin, _EulerDiscreteScheduler):
+        pass
+
+    class EulerAncestralDiscreteSchedulerCompat(_EulerCompatMixin, _EulerAncestralDiscreteScheduler):
+        pass
+
+except Exception:
+    EulerDiscreteSchedulerCompat = None
+    EulerAncestralDiscreteSchedulerCompat = None
+# --- end Euler compat ---
 
 def _apply_memory_saving(pipe):
     for fn in ("enable_vae_slicing","enable_vae_tiling","enable_model_cpu_offload"):
@@ -340,14 +299,19 @@ def _set_scheduler(pipe, name: Optional[str]):
     def _mk(Cls):
         try: return Cls.from_config(cfg) if Cls else None
         except Exception: return None
+
+    # choose compat if available
+    EulerDiscCls = EulerDiscreteSchedulerCompat or EulerDiscreteScheduler
+    EulerAncCls  = EulerAncestralDiscreteSchedulerCompat or EulerAncestralDiscreteScheduler
+
     mapping = {
         "pndm": _mk(PNDMScheduler),
         "plms": _mk(PNDMScheduler),
         "lms": _mk(LMSDiscreteScheduler),
         "heun": _mk(HeunDiscreteScheduler),
-        "euler": _mk(EulerDiscreteScheduler),
-        "euler_a": _mk(EulerAncestralDiscreteScheduler),
-        "euler_ancestral": _mk(EulerAncestralDiscreteScheduler),
+        "euler": _mk(EulerDiscCls),
+        "euler_a": _mk(EulerAncCls),
+        "euler_ancestral": _mk(EulerAncCls),
         "ddim": _mk(DDIMScheduler),
         "kdpm2": _mk(KDPM2DiscreteScheduler), "dpm2": _mk(KDPM2DiscreteScheduler),
         "kdpm2_a": _mk(KDPM2AncestralDiscreteScheduler), "kdpm2_ancestral": _mk(KDPM2AncestralDiscreteScheduler), "dpm2_a": _mk(KDPM2AncestralDiscreteScheduler),
@@ -364,11 +328,12 @@ def _set_scheduler(pipe, name: Optional[str]):
     if new_sched is not None:
         pipe.scheduler = new_sched
     
+    # compat wrapper (kept for extra safety)
     try:
         _orig = pipe.scheduler.set_timesteps
         def _set_timesteps_compat(num_inference_steps, device=None, **kwargs):
             kwargs.pop("mu", None)  # FlowMatch-only; breaks on Euler/Euler-A/etc.
-            # Euler & Euler-A don't accept custom 'sigmas' via kwargs
+            # Euler & Euler-A don't accept custom 'sigmas'
             try:
                 from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler
                 from diffusers.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteScheduler
@@ -398,11 +363,12 @@ def _apply_noise_schedule(pipe, schedule_name: Optional[str]):
     try:
         pipe.scheduler = type(sched).from_config(cfg_dict)
 
+        # re-apply compat wrapper after re-instantiation
         try:
             _orig = pipe.scheduler.set_timesteps
             def _set_timesteps_compat(num_inference_steps, device=None, **kwargs):
                 kwargs.pop("mu", None)  # FlowMatch-only; breaks on Euler/Euler-A/etc.
-                # Euler & Euler-A don't accept custom 'sigmas' via kwargs
+                # Euler & Euler-A don't accept custom 'sigmas'
                 try:
                     from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler
                     from diffusers.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteScheduler
