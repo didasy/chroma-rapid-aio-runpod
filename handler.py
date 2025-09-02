@@ -368,10 +368,11 @@ def _set_scheduler(pipe, name: Optional[str]):
         _orig = pipe.scheduler.set_timesteps
         def _set_timesteps_compat(num_inference_steps, device=None, **kwargs):
             kwargs.pop("mu", None)  # FlowMatch-only; breaks on Euler/Euler-A/etc.
-            # Euler-A also can't take custom 'sigmas' via kwargs
+            # Euler & Euler-A don't accept custom 'sigmas' via kwargs
             try:
+                from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler
                 from diffusers.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteScheduler
-                if isinstance(pipe.scheduler, EulerAncestralDiscreteScheduler):
+                if isinstance(pipe.scheduler, (EulerDiscreteScheduler, EulerAncestralDiscreteScheduler)):
                     kwargs.pop("sigmas", None)
             except Exception:
                 pass
@@ -401,10 +402,11 @@ def _apply_noise_schedule(pipe, schedule_name: Optional[str]):
             _orig = pipe.scheduler.set_timesteps
             def _set_timesteps_compat(num_inference_steps, device=None, **kwargs):
                 kwargs.pop("mu", None)  # FlowMatch-only; breaks on Euler/Euler-A/etc.
-                # Euler-A also can't take custom 'sigmas' via kwargs
+                # Euler & Euler-A don't accept custom 'sigmas' via kwargs
                 try:
+                    from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler
                     from diffusers.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteScheduler
-                    if isinstance(pipe.scheduler, EulerAncestralDiscreteScheduler):
+                    if isinstance(pipe.scheduler, (EulerDiscreteScheduler, EulerAncestralDiscreteScheduler)):
                         kwargs.pop("sigmas", None)
                 except Exception:
                     pass
