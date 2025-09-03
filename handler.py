@@ -27,9 +27,10 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def _truthy(v: Optional[str]) -> bool:
     return str(v or "").strip().lower() in ("1","true","yes","on")
 
+# Safer default: FP16 (bf16 only if explicitly requested)
 FORCE_FP16 = _truthy(os.getenv("FORCE_FP16"))
 LOW_VRAM   = _truthy(os.getenv("LOW_VRAM"))
-_dt_env    = str(os.getenv("DTYPE", "bf16")).lower()
+_dt_env    = str(os.getenv("DTYPE", "fp16")).lower()
 DTYPE      = torch.float16 if (FORCE_FP16 or _dt_env in ("fp16","float16")) else torch.bfloat16
 
 CACHE_ROOT = os.environ.get("CACHE_ROOT", "/cache")
@@ -276,7 +277,7 @@ try:
 
     class EulerDiscreteSchedulerCompat(_EulerDiscreteScheduler):
         def set_timesteps(self, num_inference_steps=None, device=None, sigmas=None, mu=None, **kwargs):
-            # Support calls like set_timesteps(sigmas=...)
+            # If called as set_timesteps(sigmas=...), infer steps
             if num_inference_steps is None and sigmas is not None:
                 try:
                     num_inference_steps = max(1, int(len(sigmas) - 1))
@@ -313,7 +314,8 @@ except Exception:
 # --- end Euler compat ---
 
 def _apply_memory_saving(pipe):
-    for fn in ("enable_vae_slicing","enable_vae_tiling","enable_model_cpu_offload"):
+    # Keep VAE slicing/tiling (harmless), avoid CPU offload unless LOW_VRAM
+    for fn in ("enable_vae_slicing","enable_vae_tiling"):
         try: getattr(pipe, fn)()
         except Exception: pass
 
@@ -342,18 +344,22 @@ def _build_pipeline(metrics: Dict[str, Any]):
         if hasattr(pipe, "transformer"):
             pipe.transformer = transformer
 
-    # Optional FlowMatch Euler
-    if FMEDS is not None and hasattr(pipe, "scheduler"):
-        try: pipe.scheduler = FMEDS.from_config(pipe.scheduler.config)
-        except Exception: pass
-
+    # DO NOT auto-swap to FlowMatch scheduler. Respect requested sampler later.
     _apply_memory_saving(pipe)
+
     if LOW_VRAM:
+        # Only offload when explicitly requested
         try: pipe.enable_sequential_cpu_offload()
         except Exception: pass
         log.info("LOW_VRAM on: sequential CPU offload.")
     else:
         pipe.to(DEVICE, dtype=DTYPE)
+
+    # Keep VAE numerically stable
+    try:
+        pipe.vae.to(DEVICE, dtype=torch.float32)
+    except Exception:
+        pass
 
     _PIPE = pipe
     log.info("Chroma pipeline ready (dtype=%s, low_vram=%s).", DTYPE, LOW_VRAM)
@@ -369,6 +375,34 @@ def _parse_size(s: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
         w, h = s.lower().split("x"); return _round8(int(w)), _round8(int(h))
     except Exception:
         return None, None
+
+def _fetch_url_bytes(url: str) -> Optional[bytes]:
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
+            "Accept": "image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+    except Exception as e:
+        log.warning("init_image fetch failed: %s", e)
+        return None
+
+def _read_init_image(val: Optional[str]) -> Optional[Image.Image]:
+    if not val or not isinstance(val, str): return None
+    try:
+        if val.startswith(("http://","https://")):
+            data = _fetch_url_bytes(val)
+            if not data: return None
+            return Image.open(io.BytesIO(data)).convert("RGB")
+        if val.startswith("data:"):
+            b64 = val.split(",", 1)[1]
+            return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+        return Image.open(io.BytesIO(base64.b64decode(val))).convert("RGB")
+    except Exception as e:
+        log.warning("init_image decode failed: %s", e)
+        return None
 
 def _set_scheduler(pipe, name: Optional[str]):
     if not name:
@@ -438,19 +472,6 @@ def _apply_noise_schedule(pipe, schedule_name: Optional[str]):
     except Exception:
         pass
 
-def _read_init_image(val: Optional[str]) -> Optional[Image.Image]:
-    if not val or not isinstance(val, str): return None
-    try:
-        if val.startswith(("http://","https://")):
-            with urllib.request.urlopen(val) as r:
-                return Image.open(io.BytesIO(r.read())).convert("RGB")
-        if val.startswith("data:"):
-            b64 = val.split(",", 1)[1]
-            return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
-        return Image.open(io.BytesIO(base64.b64decode(val))).convert("RGB")
-    except Exception:
-        return None
-
 # ------------------ Inference ------------------
 def generate_images(prompt: str, negative_prompt: Optional[str] = None,
                     steps: int = 6, num_images: int = 1,
@@ -482,6 +503,7 @@ def generate_images(prompt: str, negative_prompt: Optional[str] = None,
     if negative_prompt: base_kwargs["negative_prompt"] = negative_prompt
     if guidance_scale is not None: base_kwargs["guidance_scale"] = float(guidance_scale)
 
+    # Route init image if the pipeline supports it
     allowed = set(inspect.signature(pipe.__call__).parameters.keys())
     if init_image is not None:
         if "image" in allowed: base_kwargs["image"] = init_image
@@ -573,6 +595,10 @@ def _run_job_async(pid: str, params: Dict[str, Any]):
             dn = float(params["denoise"])
             if "strength" in allowed: kwargs["strength"] = dn
             elif "denoise" in allowed: kwargs["denoise"] = dn
+        if params.get("init_image") is not None:
+            im = params["init_image"]
+            if "image" in allowed: kwargs["image"] = im
+            elif "init_image" in allowed: kwargs["init_image"] = im
 
         out = pipe(**kwargs, generator=generator, callback=_cb, callback_steps=1)
         images = out.images if hasattr(out, "images") else out
@@ -746,7 +772,7 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "ok", "count": len(urls), "results": [{"url": u} for u in urls]}
 
 # ------------------ FastAPI app ------------------
-app = FastAPI(title="Chroma Hybrid API", version="1.3.6")
+app = FastAPI(title="Chroma Hybrid API", version="1.3.7")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:8188", "http://127.0.0.1:8188", "*"],
