@@ -275,7 +275,15 @@ try:
     )
 
     class EulerDiscreteSchedulerCompat(_EulerDiscreteScheduler):
-        def set_timesteps(self, num_inference_steps, device=None, sigmas=None, mu=None, **kwargs):
+        def set_timesteps(self, num_inference_steps=None, device=None, sigmas=None, mu=None, **kwargs):
+            # Support calls like set_timesteps(sigmas=...)
+            if num_inference_steps is None and sigmas is not None:
+                try:
+                    num_inference_steps = max(1, int(len(sigmas) - 1))
+                except Exception:
+                    pass
+            if num_inference_steps is None:
+                num_inference_steps = int(kwargs.pop("num_inference_steps", 20))
             try:
                 if hasattr(self, "sigmas"):
                     self.sigmas = None
@@ -284,7 +292,14 @@ try:
             return super().set_timesteps(num_inference_steps, device=device)
 
     class EulerAncestralDiscreteSchedulerCompat(_EulerAncestralDiscreteScheduler):
-        def set_timesteps(self, num_inference_steps, device=None, sigmas=None, mu=None, **kwargs):
+        def set_timesteps(self, num_inference_steps=None, device=None, sigmas=None, mu=None, **kwargs):
+            if num_inference_steps is None and sigmas is not None:
+                try:
+                    num_inference_steps = max(1, int(len(sigmas) - 1))
+                except Exception:
+                    pass
+            if num_inference_steps is None:
+                num_inference_steps = int(kwargs.pop("num_inference_steps", 20))
             try:
                 if hasattr(self, "sigmas"):
                     self.sigmas = None
@@ -731,7 +746,7 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "ok", "count": len(urls), "results": [{"url": u} for u in urls]}
 
 # ------------------ FastAPI app ------------------
-app = FastAPI(title="Chroma Hybrid API", version="1.3.5")
+app = FastAPI(title="Chroma Hybrid API", version="1.3.6")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:8188", "http://127.0.0.1:8188", "*"],
