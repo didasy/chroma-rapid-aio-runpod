@@ -36,8 +36,8 @@ DTYPE      = torch.float16 if (FORCE_FP16 or _dt_env in ("fp16","float16")) else
 CACHE_ROOT = os.environ.get("CACHE_ROOT", "/cache")
 os.makedirs(CACHE_ROOT, exist_ok=True)
 
-PORT        = int(os.getenv("PORT", "8000"))
-ENABLE_HTTP = not _truthy(os.getenv("ENABLE_HTTP", "1")) is False  # default on
+PORT        = int(os.getenv("PORT", "3000"))
+ENABLE_HTTP = _truthy(os.getenv("ENABLE_HTTP", "1"))  # default on
 
 MIN_FREE_GB = float(os.getenv("MIN_FREE_GB", "0"))
 
@@ -92,7 +92,7 @@ def _normalize_endpoint(url: Optional[str]) -> Optional[str]:
         return None
     u = url.strip()
     if not (u.startswith("http://") or u.startswith("https://")):
-        use_ssl = not _truthy(os.getenv("S3_USE_SSL", "1")) is False
+        use_ssl = _truthy(os.getenv("S3_USE_SSL", "1"))
         u = ("https://" if use_ssl else "http://") + u
     return u
 
@@ -105,7 +105,7 @@ S3_BUCKET   = _env.get("S3_BUCKET")
 S3_PREFIX   = _env.get("S3_PREFIX", "outputs")
 S3_PRESIGN_EXPIRES = int(_env.get("S3_PRESIGN_EXPIRES", "21600"))
 S3_CONTENT_DISPOSITION = _env.get("S3_CONTENT_DISPOSITION", "")
-S3_VERIFY_SSL = not _truthy(_env.get("S3_VERIFY_SSL", "1")) is False
+S3_VERIFY_SSL = _truthy(_env.get("S3_VERIFY_SSL", "1"))
 
 def _have_s3():
     return all([S3_ENDPOINT, S3_KEY, S3_SECRET, S3_BUCKET])
@@ -330,17 +330,33 @@ def _build_pipeline(metrics: Dict[str, Any]):
 
     # Build transformer from AIO weights
     if CTrans is not None:
-        transformer = CTrans.from_single_file(AIO_LOCAL_PATH, torch_dtype=DTYPE, low_cpu_mem_usage=True)
+        try:
+            transformer = CTrans.from_single_file(AIO_LOCAL_PATH, torch_dtype=DTYPE, low_cpu_mem_usage=True)
+        except Exception as e:
+            log.error(f"Failed to load CTrans from {AIO_LOCAL_PATH}: {e}")
+            raise
     else:
         if T2D is None:
             raise RuntimeError("No available Transformer2DModel to load AIO.")
-        transformer = T2D.from_single_file(AIO_LOCAL_PATH, torch_dtype=DTYPE, low_cpu_mem_usage=True)
+        try:
+            transformer = T2D.from_single_file(AIO_LOCAL_PATH, torch_dtype=DTYPE, low_cpu_mem_usage=True)
+        except Exception as e:
+            log.error(f"Failed to load T2D from {AIO_LOCAL_PATH}: {e}")
+            raise
 
     # Build pipeline with local snapshot
     if CPipe is not None:
-        pipe = CPipe.from_pretrained(CHROMA_LOCAL_DIR, transformer=transformer, torch_dtype=DTYPE, local_files_only=True, trust_remote_code=True)
+        try:
+            pipe = CPipe.from_pretrained(CHROMA_LOCAL_DIR, transformer=transformer, torch_dtype=DTYPE, local_files_only=True, trust_remote_code=True)
+        except Exception as e:
+            log.error(f"Failed to load CPipe from {CHROMA_LOCAL_DIR}: {e}")
+            raise
     else:
-        pipe = DiffusionPipeline.from_pretrained(CHROMA_LOCAL_DIR, torch_dtype=DTYPE, local_files_only=True, trust_remote_code=True)
+        try:
+            pipe = DiffusionPipeline.from_pretrained(CHROMA_LOCAL_DIR, torch_dtype=DTYPE, local_files_only=True, trust_remote_code=True)
+        except Exception as e:
+            log.error(f"Failed to load DiffusionPipeline from {CHROMA_LOCAL_DIR}: {e}")
+            raise
         if hasattr(pipe, "transformer"):
             pipe.transformer = transformer
 
@@ -349,17 +365,24 @@ def _build_pipeline(metrics: Dict[str, Any]):
 
     if LOW_VRAM:
         # Only offload when explicitly requested
-        try: pipe.enable_sequential_cpu_offload()
-        except Exception: pass
-        log.info("LOW_VRAM on: sequential CPU offload.")
+        try: 
+            pipe.enable_sequential_cpu_offload()
+            log.info("LOW_VRAM on: sequential CPU offload enabled.")
+        except Exception as e:
+            log.warning(f"Failed to enable sequential CPU offload: {e}")
     else:
-        pipe.to(DEVICE, dtype=DTYPE)
+        try:
+            pipe.to(DEVICE, dtype=DTYPE)
+            log.info(f"Pipeline moved to {DEVICE} with dtype {DTYPE}")
+        except Exception as e:
+            log.error(f"Failed to move pipeline to device: {e}")
+            raise
 
     # Keep VAE numerically stable
     try:
         pipe.vae.to(DEVICE, dtype=torch.float32)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"Failed to move VAE to device with float32: {e}")
 
     _PIPE = pipe
     log.info("Chroma pipeline ready (dtype=%s, low_vram=%s).", DTYPE, LOW_VRAM)
@@ -492,7 +515,7 @@ def generate_images(prompt: str, negative_prompt: Optional[str] = None,
     W = _round8(width if width else 768)
     H = _round8(height if height else 768)
     N = max(1, int(num_images))
-    steps = int(steps)
+    steps = max(1, int(steps))
 
     base_kwargs = {
         "prompt": prompt,
@@ -524,12 +547,17 @@ def generate_images(prompt: str, negative_prompt: Optional[str] = None,
         images = _single(seed)
     except RuntimeError as e:
         if "out of memory" not in str(e).lower():
+            log.error(f"Runtime error during image generation: {e}")
             raise
+        log.warning("Out of memory error encountered. Attempting to reduce memory usage...")
         torch.cuda.empty_cache()
         base_kwargs["num_inference_steps"] = min(base_kwargs["num_inference_steps"], 6)
         base_kwargs["width"]  = _round8(int(base_kwargs["width"]  * 0.75)) if base_kwargs["width"]  > 768 else 640
         base_kwargs["height"] = _round8(int(base_kwargs["height"] * 0.75)) if base_kwargs["height"] > 768 else 640
         images = _single(seed)
+    except Exception as e:
+        log.error(f"Unexpected error during image generation: {e}")
+        raise
 
     while len(images) < N:
         torch.cuda.empty_cache()
@@ -572,6 +600,8 @@ def _run_job_async(pid: str, params: Dict[str, Any]):
         guidance_scale = params.get("guidance_scale")
         seed = params.get("seed")
         fmt = str(params.get("output_format", "PNG")).upper()
+        if fmt not in ["PNG", "JPEG", "WEBP"]:
+            fmt = "PNG"
 
         W = _round8(width if width else 768)
         H = _round8(height if height else 768)
@@ -595,10 +625,13 @@ def _run_job_async(pid: str, params: Dict[str, Any]):
             dn = float(params["denoise"])
             if "strength" in allowed: kwargs["strength"] = dn
             elif "denoise" in allowed: kwargs["denoise"] = dn
-        if params.get("init_image") is not None:
-            im = params["init_image"]
-            if "image" in allowed: kwargs["image"] = im
-            elif "init_image" in allowed: kwargs["init_image"] = im
+        # Handle init_image
+        init_image = params.get("init_image")
+        if init_image is not None:
+            im = _read_init_image(init_image)
+            if im is not None:
+                if "image" in allowed: kwargs["image"] = im
+                elif "init_image" in allowed: kwargs["init_image"] = im
 
         out = pipe(**kwargs, generator=generator, callback=_cb, callback_steps=1)
         images = out.images if hasattr(out, "images") else out
@@ -620,6 +653,8 @@ def parse_comfy_prompt_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     prompt_text = negative_text = None
     steps = width = height = guidance = None
     sampler_name = denoise = None
+    init_image = None
+    
     for _, node in graph.items():
         ctype = str(node.get("class_type", "")).lower()
         inputs = node.get("inputs", {}) or {}
@@ -650,6 +685,12 @@ def parse_comfy_prompt_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
                     width, height = int(w), int(h)
             except Exception:
                 pass
+        # Check for init_image
+        if "image" in inputs and init_image is None:
+            img_data = inputs.get("image")
+            if img_data and isinstance(img_data, str):
+                init_image = img_data
+    
     if width is None or height is None:
         w, h = _parse_size(payload.get("size"))
         if w: width = w
@@ -659,7 +700,8 @@ def parse_comfy_prompt_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         except Exception: pass
     if steps is None:
         steps = int(payload.get("steps", 6))
-    return {
+    
+    result = {
         "prompt": prompt_text,
         "negative_prompt": negative_text,
         "steps": steps,
@@ -671,7 +713,14 @@ def parse_comfy_prompt_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "seed": payload.get("seed"),
         "sampler_name": sampler_name if sampler_name is not None else payload.get("sampler_name"),
         "denoise": denoise if denoise is not None else payload.get("denoise"),
+        "init_image": init_image,
     }
+    
+    # Validate output format
+    if result["output_format"] not in ["PNG", "JPEG", "WEBP"]:
+        result["output_format"] = "PNG"
+        
+    return result
 
 # ------------------ Core processing ------------------
 def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -685,16 +734,20 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
             if not p: continue
             if os.path.islink(p) or os.path.isfile(p):
                 try: os.remove(p); removed += 1
-                except Exception: pass
+                except Exception as e: log.warning(f"Failed to remove {p}: {e}")
             elif os.path.isdir(p):
                 try: shutil.rmtree(p, ignore_errors=True); removed += 1
-                except Exception: pass
+                except Exception as e: log.warning(f"Failed to remove directory {p}: {e}")
         return {"status": "ok", "cleanup_removed": removed, "free_gb": round(_free_gb(CACHE_ROOT), 2)}
 
     if input_data.get("warmup"):
-        with _PIPE_LOCK:
-            _build_pipeline({})
-        return {"status": "ok", "warmed": True}
+        try:
+            with _PIPE_LOCK:
+                _build_pipeline({})
+            return {"status": "ok", "warmed": True}
+        except Exception as e:
+            log.error(f"Warmup failed: {e}")
+            return {"status": "error", "error": f"Warmup failed: {str(e)}"}
 
     if input_data.get("size") and (not input_data.get("width") or not input_data.get("height")):
         w, h = _parse_size(input_data.get("size"))
@@ -706,23 +759,28 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
         input_data["guidance_scale"] = input_data.get("cfg")
 
     if input_data.get("comfy"):
-        params = parse_comfy_prompt_payload(input_data.get("payload") or {})
-        if not params["prompt"]:
-            return {"status": "error", "error": "No prompt text in Comfy payload"}
-        imgs = generate_images(
-            prompt=params["prompt"], negative_prompt=params["negative_prompt"],
-            steps=params["steps"], num_images=params["num_images"],
-            width=params["width"], height=params["height"],
-            guidance_scale=params["guidance_scale"], seed=params.get("seed"),
-            sampler_name=params.get("sampler_name"), denoise=params.get("denoise"),
-        )
-        if not _have_s3():
-            return {"status": "error", "error": "missing S3 envs"}
-        fmt = params["output_format"]
-        urls = [_upload_and_presign(im, fmt=fmt) for im in imgs]
-        pid = uuid.uuid4().hex
-        HISTORY[pid] = {"status": "completed", "outputs": {"result": {"images": [{"url": u} for u in urls]}}}
-        return {"status": "ok", "count": len(urls), "results": [{"url": u} for u in urls]}
+        try:
+            params = parse_comfy_prompt_payload(input_data.get("payload") or {})
+            if not params["prompt"]:
+                return {"status": "error", "error": "No prompt text in Comfy payload"}
+            imgs = generate_images(
+                prompt=params["prompt"], negative_prompt=params["negative_prompt"],
+                steps=params["steps"], num_images=params["num_images"],
+                width=params["width"], height=params["height"],
+                guidance_scale=params["guidance_scale"], seed=params.get("seed"),
+                sampler_name=params.get("sampler_name"), denoise=params.get("denoise"),
+                init_image=_read_init_image(params.get("init_image")),
+            )
+            if not _have_s3():
+                return {"status": "error", "error": "missing S3 envs"}
+            fmt = params["output_format"]
+            urls = [_upload_and_presign(im, fmt=fmt) for im in imgs]
+            pid = uuid.uuid4().hex
+            HISTORY[pid] = {"status": "completed", "outputs": {"result": {"images": [{"url": u} for u in urls]}}}
+            return {"status": "ok", "count": len(urls), "results": [{"url": u} for u in urls]}
+        except Exception as e:
+            log.error(f"ComfyUI processing failed: {e}")
+            return {"status": "error", "error": f"ComfyUI processing failed: {str(e)}"}
 
     prompt = input_data.get("prompt")
     if not prompt:
@@ -750,29 +808,35 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
                 time.sleep(0.5)
         return StreamingResponse(event_gen(), media_type="text/event-stream")
 
-    init_img = _read_init_image(input_data.get("init_image") or input_data.get("image") or input_data.get("init_image_url") or input_data.get("image_url"))
-    imgs = generate_images(
-        prompt=prompt,
-        negative_prompt=input_data.get("negative_prompt"),
-        steps=int(input_data.get("steps", 6)),
-        num_images=int(input_data.get("num_images", 1)),
-        width=input_data.get("width"),
-        height=input_data.get("height"),
-        guidance_scale=input_data.get("guidance_scale"),
-        seed=input_data.get("seed"),
-        scheduler=input_data.get("scheduler"),
-        sampler_name=input_data.get("sampler_name"),
-        denoise=input_data.get("denoise"),
-        init_image=init_img,
-    )
-    if not _have_s3():
-        return {"status": "error", "error": "missing S3 envs"}
-    fmt = str(input_data.get("output_format", "PNG")).upper()
-    urls = [_upload_and_presign(im, fmt=fmt) for im in imgs]
-    return {"status": "ok", "count": len(urls), "results": [{"url": u} for u in urls]}
+    try:
+        init_img = _read_init_image(input_data.get("init_image") or input_data.get("image") or input_data.get("init_image_url") or input_data.get("image_url"))
+        imgs = generate_images(
+            prompt=prompt,
+            negative_prompt=input_data.get("negative_prompt"),
+            steps=int(input_data.get("steps", 6)),
+            num_images=int(input_data.get("num_images", 1)),
+            width=input_data.get("width"),
+            height=input_data.get("height"),
+            guidance_scale=input_data.get("guidance_scale"),
+            seed=input_data.get("seed"),
+            scheduler=input_data.get("scheduler"),
+            sampler_name=input_data.get("sampler_name"),
+            denoise=input_data.get("denoise"),
+            init_image=init_img,
+        )
+        if not _have_s3():
+            return {"status": "error", "error": "missing S3 envs"}
+        fmt = str(input_data.get("output_format", "PNG")).upper()
+        if fmt not in ["PNG", "JPEG", "WEBP"]:
+            fmt = "PNG"
+        urls = [_upload_and_presign(im, fmt=fmt) for im in imgs]
+        return {"status": "ok", "count": len(urls), "results": [{"url": u} for u in urls]}
+    except Exception as e:
+        log.error(f"Image generation failed: {e}")
+        return {"status": "error", "error": f"Image generation failed: {str(e)}"}
 
 # ------------------ FastAPI app ------------------
-app = FastAPI(title="Chroma Hybrid API", version="1.3.7")
+app = FastAPI(title="Chroma Hybrid API", version="1.3.8")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:8188", "http://127.0.0.1:8188", "*"],
@@ -788,7 +852,8 @@ def health():
                 _build_pipeline({})
         return {"status": "ok", "ready": True, "device": str(DEVICE), "dtype": str(DTYPE), "low_vram": LOW_VRAM}
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        log.error(f"Health check failed: {e}")
+        return {"status": "error", "error": str(e), "ready": False}
 
 @app.post("/run")
 def http_run(input_data: Dict[str, Any] = Body(...)):
@@ -798,51 +863,74 @@ def http_run(input_data: Dict[str, Any] = Body(...)):
     except HTTPException:
         raise
     except Exception as e:
-        log.exception("http_run error"); raise HTTPException(status_code=500, detail=str(e))
+        log.exception("http_run error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/prompt")
 def comfy_prompt(payload: Dict[str, Any] = Body(...)):
-    params = parse_comfy_prompt_payload(payload)
-    if not params["prompt"]:
-        raise HTTPException(status_code=400, detail="No prompt text found in graph or payload.")
-    pid = uuid.uuid4().hex
-    HISTORY.pop(pid, None); PROGRESS.pop(pid, None)
-    t = threading.Thread(target=_run_job_async, args=(pid, params), daemon=True)
-    t.start()
-    return {"prompt_id": pid}
+    try:
+        params = parse_comfy_prompt_payload(payload)
+        if not params["prompt"]:
+            raise HTTPException(status_code=400, detail="No prompt text found in graph or payload.")
+        pid = uuid.uuid4().hex
+        HISTORY.pop(pid, None); PROGRESS.pop(pid, None)
+        t = threading.Thread(target=_run_job_async, args=(pid, params), daemon=True)
+        t.start()
+        return {"prompt_id": pid}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("comfy_prompt error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/history/{prompt_id}")
 def comfy_history(prompt_id: str):
-    rec = HISTORY.get(prompt_id)
-    if not rec: raise HTTPException(status_code=404, detail="not found")
-    return rec
+    try:
+        rec = HISTORY.get(prompt_id)
+        if not rec: 
+            raise HTTPException(status_code=404, detail="not found")
+        return rec
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("comfy_history error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/progress/{prompt_id}")
 def comfy_progress(prompt_id: str):
-    return PROGRESS.get(prompt_id, {"status": "unknown"})
+    try:
+        return PROGRESS.get(prompt_id, {"status": "unknown"})
+    except Exception as e:
+        log.exception("comfy_progress error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/sse/{prompt_id}")
 def comfy_sse(prompt_id: str):
-    def event_gen():
-        last = None
-        while True:
-            rec = PROGRESS.get(prompt_id)
-            if rec is None:
-                yield f"event: gone\ndata: {prompt_id}\n\n"; return
-            if rec != last:
-                payload = {k: rec.get(k) for k in ("status","step","total","percent","updated","error")}
-                payload["prompt_id"] = prompt_id
-                import json as _json
-                yield "data: " + _json.dumps(payload) + "\n\n"
-                last = dict(rec)
-            if rec.get("status") in ("completed", "error"): return
-            time.sleep(0.5)
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
+    try:
+        def event_gen():
+            last = None
+            while True:
+                rec = PROGRESS.get(prompt_id)
+                if rec is None:
+                    yield f"event: gone\ndata: {prompt_id}\n\n"; return
+                if rec != last:
+                    payload = {k: rec.get(k) for k in ("status","step","total","percent","updated","error")}
+                    payload["prompt_id"] = prompt_id
+                    import json as _json
+                    yield "data: " + _json.dumps(payload) + "\n\n"
+                    last = dict(rec)
+                if rec.get("status") in ("completed", "error"): return
+                time.sleep(0.5)
+        return StreamingResponse(event_gen(), media_type="text/event-stream")
+    except Exception as e:
+        log.exception("comfy_sse error")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # ------------------ Runpod Queue mode handler ------------------
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
-    data = event.get("input") or {}
     try:
+        data = event.get("input") or {}
         return process_input(data)
     except Exception as e:
         log.exception("handler error")
@@ -853,7 +941,8 @@ def _start_http_server():
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
 
 if ENABLE_HTTP:
-    threading.Thread(target=_start_http_server, daemon=True).start()
+    server_thread = threading.Thread(target=_start_http_server, daemon=True)
+    server_thread.start()
 
 # Queue worker (blocks main thread)
 runpod.serverless.start({"handler": handler})
