@@ -378,11 +378,11 @@ def _build_pipeline(metrics: Dict[str, Any]):
             log.error(f"Failed to move pipeline to device: {e}")
             raise
 
-    # Keep VAE numerically stable
+    # Keep VAE numerically stable - use same dtype as main pipeline to avoid type mismatches
     try:
-        pipe.vae.to(DEVICE, dtype=torch.float32)
+        pipe.vae.to(DEVICE, dtype=DTYPE)
     except Exception as e:
-        log.warning(f"Failed to move VAE to device with float32: {e}")
+        log.warning(f"Failed to move VAE to device with {DTYPE}: {e}")
 
     _PIPE = pipe
     log.info("Chroma pipeline ready (dtype=%s, low_vram=%s).", DTYPE, LOW_VRAM)
