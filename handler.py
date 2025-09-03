@@ -267,34 +267,31 @@ def _import_diffusers():
         T2D = None
     return DiffusionPipeline, FlowMatchEulerDiscreteScheduler, CPipe, CTrans, T2D
 
-# --- Euler compat: ignore unsupported kwargs ('sigmas', 'mu') in set_timesteps ---
+# --- Euler compat: explicitly accept 'sigmas' and 'mu' and ignore them ---
 try:
     from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler as _EulerDiscreteScheduler
     from diffusers.schedulers.scheduling_euler_ancestral_discrete import (
         EulerAncestralDiscreteScheduler as _EulerAncestralDiscreteScheduler
     )
 
-    class _EulerCompatMixin:
-        def set_timesteps(self, *args, **kwargs):
-            # Accept & drop extras whether passed positionally or by name
-            kwargs.pop("sigmas", None)
-            kwargs.pop("mu", None)
-            # Trim any extra positional args beyond (num_steps, device)
-            if len(args) > 2:
-                args = args[:2]
-            # Clear any pre-set schedule attribute that could confuse logic
+    class EulerDiscreteSchedulerCompat(_EulerDiscreteScheduler):
+        def set_timesteps(self, num_inference_steps, device=None, sigmas=None, mu=None, **kwargs):
+            # Ignore custom sigma schedules & flowmatch mu
             try:
                 if hasattr(self, "sigmas"):
                     self.sigmas = None
             except Exception:
                 pass
-            return super().set_timesteps(*args, **kwargs)
+            return super().set_timesteps(num_inference_steps, device=device)
 
-    class EulerDiscreteSchedulerCompat(_EulerCompatMixin, _EulerDiscreteScheduler):
-        pass
-
-    class EulerAncestralDiscreteSchedulerCompat(_EulerCompatMixin, _EulerAncestralDiscreteScheduler):
-        pass
+    class EulerAncestralDiscreteSchedulerCompat(_EulerAncestralDiscreteScheduler):
+        def set_timesteps(self, num_inference_steps, device=None, sigmas=None, mu=None, **kwargs):
+            try:
+                if hasattr(self, "sigmas"):
+                    self.sigmas = None
+            except Exception:
+                pass
+            return super().set_timesteps(num_inference_steps, device=device)
 
 except Exception:
     EulerDiscreteSchedulerCompat = None
@@ -360,26 +357,22 @@ def _parse_size(s: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
         return None, None
 
 def _patch_set_timesteps(pipe):
-    """Instance-level patch: tolerate stray 'sigmas'/'mu' and extra positionals."""
+    """Instance-level safety: accept sigmas/mu and ignore."""
     try:
         _orig = pipe.scheduler.set_timesteps
     except Exception:
         return
-    def _compat(*args, **kwargs):
-        kwargs.pop("sigmas", None)
-        kwargs.pop("mu", None)
-        if len(args) > 2:
-            args = args[:2]
+    def _compat(num_inference_steps, device=None, sigmas=None, mu=None, **kwargs):
         try:
             if hasattr(pipe.scheduler, "sigmas"):
                 pipe.scheduler.sigmas = None
         except Exception:
             pass
-        return _orig(*args, **kwargs)
+        return _orig(num_inference_steps, device=device)
     pipe.scheduler.set_timesteps = _compat
 
 def _set_scheduler(pipe, name: Optional[str]):
-    if not name: 
+    if not name:
         _patch_set_timesteps(pipe)  # still patch to be safe
         return
     try:
@@ -431,7 +424,7 @@ def _set_scheduler(pipe, name: Optional[str]):
     if new_sched is not None:
         pipe.scheduler = new_sched
 
-    # instance-level patch (handles any later calls)
+    # instance-level safety after replacement
     _patch_set_timesteps(pipe)
 
 def _apply_noise_schedule(pipe, schedule_name: Optional[str]):
@@ -456,7 +449,7 @@ def _apply_noise_schedule(pipe, schedule_name: Optional[str]):
         pipe.scheduler = type(sched).from_config(cfg_dict)
     except Exception:
         pass
-    # re-apply instance-level patch after re-instantiation
+    # re-apply instance-level safety after re-instantiation
     _patch_set_timesteps(pipe)
 
 def _read_init_image(val: Optional[str]) -> Optional[Image.Image]:
@@ -767,7 +760,7 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "ok", "count": len(urls), "results": [{"url": u} for u in urls]}
 
 # ------------------ FastAPI app ------------------
-app = FastAPI(title="Chroma Hybrid API", version="1.3.3")
+app = FastAPI(title="Chroma Hybrid API", version="1.3.4")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:8188", "http://127.0.0.1:8188", "*"],
