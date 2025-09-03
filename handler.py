@@ -378,11 +378,23 @@ def _build_pipeline(metrics: Dict[str, Any]):
             log.error(f"Failed to move pipeline to device: {e}")
             raise
 
-    # Keep VAE numerically stable - use same dtype as main pipeline to avoid type mismatches
+    # Keep VAE numerically stable in float32 for better quality
     try:
-        pipe.vae.to(DEVICE, dtype=DTYPE)
+        pipe.vae.to(DEVICE, dtype=torch.float32)
+        log.info("VAE moved to device with float32 for numerical stability")
     except Exception as e:
-        log.warning(f"Failed to move VAE to device with {DTYPE}: {e}")
+        log.warning(f"Failed to move VAE to device with float32: {e}")
+        
+    # Enable all available memory saving techniques
+    _apply_memory_saving(pipe)
+    
+    # Enable mixed precision inference if available
+    if hasattr(pipe, 'enable_xformers_memory_efficient_attention'):
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+            log.info("Enabled xformers memory efficient attention")
+        except Exception as e:
+            log.warning(f"Failed to enable xformers memory efficient attention: {e}")
 
     _PIPE = pipe
     log.info("Chroma pipeline ready (dtype=%s, low_vram=%s).", DTYPE, LOW_VRAM)
@@ -539,9 +551,23 @@ def generate_images(prompt: str, negative_prompt: Optional[str] = None,
         gen = torch.Generator(device=DEVICE) if torch.cuda.is_available() else torch.Generator()
         if gen_seed is not None:
             gen = gen.manual_seed(int(gen_seed))
-        out = pipe(**base_kwargs, generator=gen)
-        imgs = out.images if hasattr(out, "images") else out
-        return imgs if isinstance(imgs, list) else [imgs]
+        
+        try:
+            # Use autocast for mixed precision to handle dtype mismatches
+            with torch.autocast("cuda", dtype=torch.float16, enabled=True):
+                out = pipe(**base_kwargs, generator=gen)
+            imgs = out.images if hasattr(out, "images") else out
+            return imgs if isinstance(imgs, list) else [imgs]
+        except Exception as e:
+            log.error(f"Error in _single: {e}")
+            # Try without autocast as fallback
+            try:
+                out = pipe(**base_kwargs, generator=gen)
+                imgs = out.images if hasattr(out, "images") else out
+                return imgs if isinstance(imgs, list) else [imgs]
+            except Exception as e2:
+                log.error(f"Fallback generation also failed: {e2}")
+                raise
 
     try:
         images = _single(seed)
@@ -633,7 +659,14 @@ def _run_job_async(pid: str, params: Dict[str, Any]):
                 if "image" in allowed: kwargs["image"] = im
                 elif "init_image" in allowed: kwargs["init_image"] = im
 
-        out = pipe(**kwargs, generator=generator, callback=_cb, callback_steps=1)
+        # Use autocast for mixed precision to handle dtype mismatches
+        try:
+            with torch.autocast("cuda", dtype=torch.float16, enabled=True):
+                out = pipe(**kwargs, generator=generator, callback=_cb, callback_steps=1)
+        except Exception as e:
+            log.error(f"Autocast generation failed: {e}")
+            # Try without autocast as fallback
+            out = pipe(**kwargs, generator=generator, callback=_cb, callback_steps=1)
         images = out.images if hasattr(out, "images") else out
         if not isinstance(images, list): images = [images]
 
