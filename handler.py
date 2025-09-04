@@ -527,7 +527,13 @@ def generate_images(prompt: str, negative_prompt: Optional[str] = None,
     W = _round8(width if width else 768)
     H = _round8(height if height else 768)
     N = max(1, int(num_images))
-    steps = max(1, int(steps))
+    
+    # Validate and adjust steps - too high steps can cause issues
+    steps = max(1, min(int(steps), 25))  # Cap at 25 steps
+    
+    # Validate and adjust guidance scale - too low values can cause black images
+    if guidance_scale is not None:
+        guidance_scale = max(float(guidance_scale), 1.0)  # Minimum guidance of 1.0
 
     base_kwargs = {
         "prompt": prompt,
@@ -553,6 +559,9 @@ def generate_images(prompt: str, negative_prompt: Optional[str] = None,
             gen = gen.manual_seed(int(gen_seed))
         
         try:
+            # Log generation parameters for debugging
+            log.info(f"Generating image with parameters: {base_kwargs}")
+            
             # Use autocast for mixed precision to handle dtype mismatches
             with torch.autocast("cuda", dtype=torch.float16, enabled=True):
                 out = pipe(**base_kwargs, generator=gen)
@@ -632,6 +641,13 @@ def _run_job_async(pid: str, params: Dict[str, Any]):
         W = _round8(width if width else 768)
         H = _round8(height if height else 768)
 
+        # Validate and adjust steps - too high steps can cause issues
+        steps = max(1, min(int(steps), 25))  # Cap at 25 steps
+        
+        # Validate and adjust guidance scale - too low values can cause black images
+        if guidance_scale is not None:
+            guidance_scale = max(float(guidance_scale), 1.0)  # Minimum guidance of 1.0
+
         kwargs = {"prompt": prompt,"num_inference_steps": steps,"width": W,"height": H}
         if negative_prompt: kwargs["negative_prompt"] = negative_prompt
         if guidance_scale is not None: kwargs["guidance_scale"] = float(guidance_scale)
@@ -661,6 +677,9 @@ def _run_job_async(pid: str, params: Dict[str, Any]):
 
         # Use autocast for mixed precision to handle dtype mismatches
         try:
+            # Log generation parameters for debugging
+            log.info(f"Generating image with parameters: {kwargs}")
+            
             with torch.autocast("cuda", dtype=torch.float16, enabled=True):
                 out = pipe(**kwargs, generator=generator, callback=_cb, callback_steps=1)
         except Exception as e:
@@ -843,14 +862,26 @@ def process_input(input_data: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         init_img = _read_init_image(input_data.get("init_image") or input_data.get("image") or input_data.get("init_image_url") or input_data.get("image_url"))
+        
+        # Get and validate parameters
+        steps = int(input_data.get("steps", 6))
+        guidance_scale = input_data.get("guidance_scale")
+        
+        # Validate and adjust steps - too high steps can cause issues
+        steps = max(1, min(int(steps), 25))  # Cap at 25 steps
+        
+        # Validate and adjust guidance scale - too low values can cause black images
+        if guidance_scale is not None:
+            guidance_scale = max(float(guidance_scale), 1.0)  # Minimum guidance of 1.0
+        
         imgs = generate_images(
             prompt=prompt,
             negative_prompt=input_data.get("negative_prompt"),
-            steps=int(input_data.get("steps", 6)),
+            steps=steps,
             num_images=int(input_data.get("num_images", 1)),
             width=input_data.get("width"),
             height=input_data.get("height"),
-            guidance_scale=input_data.get("guidance_scale"),
+            guidance_scale=guidance_scale,
             seed=input_data.get("seed"),
             scheduler=input_data.get("scheduler"),
             sampler_name=input_data.get("sampler_name"),
